@@ -4,40 +4,4 @@ A lightweight, high-latency, and resilient communication tool designed for emerg
 ## 📖 Overview
 In crisis scenarios, DNS often remains the last standing bridge between a restricted network and the global internet. BeaconDNS utilizes the DNS protocol to transmit short, end-to-end encrypted text messages between a user inside a restricted zone and a recipient outside.
 
-### ⚠️ Project Scope
-- **Target:** Emergency short messaging (SMS-style).
-- **Not for:** Browsing, VPN, file transfer, or high-speed chat.
-- **Focus:** Simplicity, Low-detectability, and High-compatibility.
-
----
-
-## 🏗️ System Architecture
-
-
-
-1. **Iran Client:** A simple UI that encodes and encrypts messages into DNS queries (subdomains).
-2. **DNS Gateway (Server):** An authoritative DNS server that intercepts queries, extracts data, and stores messages in a queue.
-3. **Outside UI:** A web or CLI interface for the external user to read and reply to messages.
-
----
-
-## 🔒 Security Features
-- **End-to-End Encryption (E2EE):** Messages are encrypted/decrypted only on the clients using AEAD (e.g., ChaCha20-Poly1305).
-- **Anti-Replay:** Implements sequence counters and timestamp windows.
-- **Privacy:** The Gateway only sees encrypted blobs; no raw text is stored.
-- **Base32 Encoding:** Ensures DNS compatibility and avoids case-sensitivity issues.
-
----
-
-## 🚀 Getting Started
-
-### Prerequisites
-- A domain name (e.g., `example.com`).
-- A VPS with a public IP.
-- Port 53 (UDP) must be open.
-
-### Server Setup (Quick Start)
-1. Disable local DNS resolvers:
-   ```bash
-   sudo systemctl stop systemd-resolved
-   sudo systemctl disable systemd-resolved
+📡 Peyk-D: Master Technical SpecificationEmergency Asynchronous Messaging over DNSProject Codename: Peyk-D (Messenger over DNS)Target: Resilience in White-listed Network Environments۱. فلسفه و اهداف (Core Mission)پروژه Peyk-D برای ایجاد یک پل ارتباطی حداقلی (Minimalist) در شرایطی طراحی شده که اینترنت بین‌المللی کاملاً محدود شده و تنها سرویس فعال، DNS Resolution است.تمرکز: پیام‌های متنی کوتاه (Status updates/Emergency alerts).اصل حاکم: اولویت با پایداری (Resilience) و سادگی برای کاربر نهایی است.۲. نقشه راه اجرایی (The 8-Phase Roadmap)🔹 فاز ۰: Validation of the Wire (اثبات مسیر)اقدام: راه‌اندازی Sniffer روی پورت 53 UDP سرور.تست: ارسال کوئری از ISPهای مختلف ایران (مخابرات، همراه اول، ایرانسل).هدف: شناسایی Case-Normalization (تبدیل حروف بزرگ به کوچک) و محدودیت کاراکتر در هر Label.خروجی: انتخاب متد Encoding نهایی (Base32/Base64).🔹 فاز ۱: Minimal Semantics & Observabilityاقدام: تعریف ساختار Pair ID.هدف: تفکیک ترافیک کاربران بدون دسترسی به محتوا.مانیتورینگ: ثبت نرخ درخواست‌ها برای شناسایی اختلالات لحظه‌ای در شبکه.🔹 فاز ۲: Message Lifecycle & State Machineاقدام: تعریف وضعیت پیام (Created, Pending, Sent).مدیریت UDP: پیاده‌سازی Idempotency. اگر پکت‌های تکراری به دلیل اختلال شبکه رسید، سرور فقط یک نسخه را در صف Redis ذخیره می‌کند.🔹 فاز ۳: Security Hardening (E2EE)اقدام: رمزنگاری سرتاسری.الگوریتم: ChaCha20-Poly1305.بهینه‌سازی: استفاده از Sequence Number به عنوان Nonce برای کاهش Overhead در پکت DNS.🔹 فاز ۴: Client UX & Intelligent Polling (بخش کلیدی)این فاز مسئولیت تعامل با کاربر و بقای اپلیکیشن در شبکه را دارد.رابط کاربری: طراحی Minimalist (فقط فیلد پیام و دکمه ارسال).وضعیت بصری: نمایش دقیق وضعیت پکت (در صف ارسال / تحویل شده به سرور).Adaptive Polling: - استفاده از Jitter ($\pm 20\%$) برای تغییر زمان درخواست‌ها و جلوگیری از شناسایی الگو توسط DPI.Exponential Backoff: افزایش بازه زمانی پولینگ در صورت نبود پیام جدید یا اختلال شدید در شبکه.🔹 فاز ۵: DNS Compatibility & FragmentationFragmentation: تکه‌تکه کردن پیام‌های بلند به Labelهای ۶۳ کاراکتری.فرمت پکت: [Part_Index].[Total_Parts].[Payload].[Pair_ID].peyk-d.irRFC-Compliance: تولید پاسخ‌های معتبر (A Record) برای جلوگیری از شناسایی به عنوان آنومالی.🔹 فاز ۶: Operational Readiness (عملیاتی‌سازی)امنیت سرور: مقابله با حملات DNS Amplification.Auto-purge: حذف خودکار پیام‌ها از Redis بعد از ۷۲ ساعت جهت حفظ حریم خصوصی.🔹 فاز ۷: Documentation & Handoverمستندات: راهنمای کاربر مبتدی و مدل تهدید (Threat Model) نهایی شده بر اساس دیتای واقعی فاز ۰.۳. مدل تهدید (Threat Model)Adversary: سیستم‌های تحلیل پکت پیشرفته (DPI).Defense: رمزنگاری محتوا + مبهم‌سازی زمان (Timing Obfuscation).Survivability: استفاده از دامنه‌های رزرو در صورت مسدود شدن دامنه اصلی.
