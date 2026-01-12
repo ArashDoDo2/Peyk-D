@@ -37,6 +37,8 @@ dependencies:
   base32: ^2.2.0
   encrypt: ^5.0.3
   shared_preferences: ^2.5.4
+  flutter_secure_storage: ^10.0.0
+  cryptography: ^2.9.0
 
 dev_dependencies:
   flutter_test:
