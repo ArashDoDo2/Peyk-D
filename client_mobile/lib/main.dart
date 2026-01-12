@@ -1,6 +1,8 @@
 import 'dart:io';
-import 'package:flutter/material.dart';
 import 'dart:convert';
+import 'dart:typed_data'; // حتماً این خط را اضافه کنید
+import 'package:flutter/material.dart';
+import 'package:base32/base32.dart';
 
 void main() {
   runApp(const PeykDApp());
@@ -32,35 +34,38 @@ class _MessageScreenState extends State<MessageScreen> {
 
   // تابع ارسال پکت واقعی UDP به سمت کامپیوتر
   void sendDnsMessage(String message) async {
-    if (message.isEmpty) return;
+  if (message.isEmpty) return;
 
-    try {
-      // 1. آدرس جادویی برای دسترسی به ویندوز از داخل امولاتور
-      const String hostIP = "10.0.2.2"; 
-      const int port = 53; 
+  try {
+    const String hostIP = "10.0.2.2"; 
+    const int port = 53; 
 
-      // 2. ساخت ساب‌دامنه (طبق استراتژی پروژه: حروف کوچک)
-      String payload = message.toLowerCase().trim().replaceAll(' ', '-');
-      String fullDomain = "$payload.p99.peyk-d.ir";
+    // ۱. تبدیل متن به بایت‌های UTF-8 (برای پشتیبانی از فارسی)
+    List<int> messageBytes = utf8.encode(message);
 
-      // 3. باز کردن سوکت و ارسال پکت خام
-      RawDatagramSocket.bind(InternetAddress.anyIPv4, 0).then((RawDatagramSocket socket) {
-        // تبدیل متن به بایت و ارسال
-        socket.send(utf8.encode(fullDomain), InternetAddress(hostIP), port);
-        socket.close(); // بستن بلافاصله سوکت بعد از ارسال
-        
-        setState(() {
-          _status = "✅ Sent to 10.0.2.2:53 -> $fullDomain";
-        });
-        print("UDP Packet Dispatched: $fullDomain");
-      });
+    // ۲. کدگذاری به Base32
+    String encoded = base32.encode(Uint8List.fromList(messageBytes));
+    
+    // ۳. حذف علامت '=' (Padding) چون در DNS مجاز نیست و کوچک کردن حروف
+    String dnsSafePayload = encoded.replaceAll('=', '').toLowerCase();
+    
+    // ۴. ساخت ساب‌دامنه نهایی
+    String fullDomain = "$dnsSafePayload.p99.peyk-d.ir";
 
-    } catch (e) {
+    RawDatagramSocket.bind(InternetAddress.anyIPv4, 0).then((RawDatagramSocket socket) {
+      socket.send(utf8.encode(fullDomain), InternetAddress(hostIP), port);
+      socket.close();
+      
       setState(() {
-        _status = "❌ Socket Error: $e";
+        _status = "✅ Encoded & Sent: $fullDomain";
       });
-    }
+    });
+  } catch (e) {
+    setState(() {
+      _status = "❌ Error: $e";
+    });
   }
+}
 
   @override
   Widget build(BuildContext context) {
