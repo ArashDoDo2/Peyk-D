@@ -1,113 +1,200 @@
 import 'dart:io';
 import 'dart:convert';
-import 'dart:typed_data'; // حتماً این خط را اضافه کنید
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:base32/base32.dart';
 import 'package:encrypt/encrypt.dart' as enc;
+import 'package:shared_preferences/shared_preferences.dart';
 
-void main() {
-  runApp(const PeykDApp());
-}
+void main() => runApp(const PeykDApp());
 
 class PeykDApp extends StatelessWidget {
   const PeykDApp({super.key});
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      debugShowCheckedModeBanner: false, // حذف نوار تست
-      theme: ThemeData(primarySwatch: Colors.blue),
-      home: const MessageScreen(),
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(primarySwatch: Colors.blueGrey, useMaterial3: true),
+      home: const ChatScreen(),
     );
   }
 }
 
-class MessageScreen extends StatefulWidget {
-  const MessageScreen({super.key});
+class ChatScreen extends StatefulWidget {
+  const ChatScreen({super.key});
+  @override
+  State<ChatScreen> createState() => _ChatScreenState();
+}
+
+class _ChatScreenState extends State<ChatScreen> {
+  final TextEditingController _controller = TextEditingController();
+  final List<Map<String, String>> _messages = [];
+  
+  // مقادیر شبکه (که از تنظیمات خوانده می‌شوند)
+  String _serverIP = "10.0.2.2";
+  String _baseDomain = "p99.peyk-d.ir";
+  String _status = "Ready";
+
+  // تنظیمات امنیتی AES
+  final key = enc.Key.fromUtf8('my32characterslongsecretkey12345');
+  final iv = enc.IV.fromUtf8('1212312312312312');
 
   @override
-  State<MessageScreen> createState() => _MessageScreenState();
-}
-
-class _MessageScreenState extends State<MessageScreen> {
-  final TextEditingController _controller = TextEditingController();
-  String _status = "Ready to send";
-
-  // تابع ارسال پکت واقعی UDP به سمت کامپیوتر
-void sendDnsMessage(String message) async {
-  if (message.isEmpty) return;
-
-  try {
-    // ۱. تنظیم کلید و IV (باید دقیقا با سرور یکی باشد)
-    final key = enc.Key.fromUtf8('my32characterslongsecretkey12345'); // ۳۲ کاراکتر
-    final iv = enc.IV.fromUtf8('1212312312312312'); // ۱۶ کاراکتر
-    final encrypter = enc.Encrypter(enc.AES(key, mode: enc.AESMode.cbc));
-
-    // ۲. رمزنگاری متن اصلی
-    final encrypted = encrypter.encrypt(message, iv: iv);
-    String encryptedString = encrypted.base64; // ابتدا به بیس ۶۴ تبدیل میکنیم تا راحت تر جابجا شود
-
-    // ۳. تبدیل خروجی رمز شده به Base32 (برای عبور از DNS)
-    List<int> encryptedBytes = utf8.encode(encryptedString);
-    String dnsSafePayload = base32.encode(Uint8List.fromList(encryptedBytes)).replaceAll('=', '').toLowerCase();
-
-    // ۴. تقسیم به تکه‌های ۵۰ کاراکتری و ارسال (همان منطق فاز ۲)
-    int chunkSize = 50;
-    for (var i = 0; i < dnsSafePayload.length; i += chunkSize) {
-      String chunk = dnsSafePayload.substring(i, i + chunkSize > dnsSafePayload.length ? dnsSafePayload.length : i + chunkSize);
-      int index = (i / chunkSize).floor() + 1;
-      int total = (dnsSafePayload.length / chunkSize).ceil();
-      
-      String packet = "$index-$total-$chunk.p99.peyk-d.ir";
-      
-      RawDatagramSocket.bind(InternetAddress.anyIPv4, 0).then((socket) {
-        socket.send(utf8.encode(packet), InternetAddress("10.0.2.2"), 53);
-        socket.close();
-      });
-      await Future.delayed(Duration(milliseconds: 100));
-    }
-
-    setState(() { _status = "🔐 Encrypted & Sent in ${(dnsSafePayload.length / chunkSize).ceil()} chunks"; });
-  } catch (e) {
-    setState(() { _status = "❌ Encryption Error: $e"; });
+  void initState() {
+    super.initState();
+    _loadSettings();
   }
-}
+
+  // بارگذاری تنظیمات از حافظه گوشی
+  _loadSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _serverIP = prefs.getString('server_ip') ?? "10.0.2.2";
+      _baseDomain = prefs.getString('base_domain') ?? "p99.peyk-d.ir";
+    });
+  }
+
+  // نمایش دیالوگ تنظیمات
+  void _showSettingsDialog() {
+    TextEditingController ipCtrl = TextEditingController(text: _serverIP);
+    TextEditingController domainCtrl = TextEditingController(text: _baseDomain);
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Network Settings"),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(controller: ipCtrl, decoration: const InputDecoration(labelText: "Server IP")),
+            TextField(controller: domainCtrl, decoration: const InputDecoration(labelText: "Base Domain")),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel")),
+          ElevatedButton(
+            onPressed: () async {
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setString('server_ip', ipCtrl.text);
+              await prefs.setString('base_domain', domainCtrl.text);
+              _loadSettings();
+              Navigator.pop(context);
+            },
+            child: const Text("Save"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // تابع ارسال پیام رمزنگاری شده و تکه‌تکه شده
+  void _sendMessage() async {
+    String text = _controller.text.trim();
+    if (text.isEmpty) return;
+
+    setState(() {
+      _messages.insert(0, {"text": text, "sender": "user"});
+      _status = "Encrypting...";
+    });
+    _controller.clear();
+
+    try {
+      // ۱. رمزنگاری AES
+      final encrypter = enc.Encrypter(enc.AES(key, mode: enc.AESMode.cbc));
+      final encrypted = encrypter.encrypt(text, iv: iv);
+      
+      // ۲. تبدیل به Base32 برای DNS
+      String encryptedBase64 = encrypted.base64;
+      String dnsSafePayload = base32.encode(Uint8List.fromList(utf8.encode(encryptedBase64))).replaceAll('=', '').toLowerCase();
+
+      // ۳. تقسیم به تکه‌های ۵۰ کاراکتری
+      int chunkSize = 50;
+      int totalChunks = (dnsSafePayload.length / chunkSize).ceil();
+
+      for (var i = 0; i < dnsSafePayload.length; i += chunkSize) {
+        String chunk = dnsSafePayload.substring(i, i + chunkSize > dnsSafePayload.length ? dnsSafePayload.length : i + chunkSize);
+        int index = (i / chunkSize).floor() + 1;
+        
+        // استفاده از دامنه تنظیم شده توسط کاربر
+        String fullDomain = "$index-$totalChunks-$chunk.$_baseDomain";
+
+        RawDatagramSocket.bind(InternetAddress.anyIPv4, 0).then((socket) {
+          // ارسال به IP تنظیم شده توسط کاربر
+          socket.send(utf8.encode(fullDomain), InternetAddress(_serverIP), 53);
+          socket.close();
+        });
+        
+        await Future.delayed(const Duration(milliseconds: 150));
+      }
+      
+      setState(() => _status = "Sent ✅ to $_serverIP");
+    } catch (e) {
+      setState(() => _status = "Error ❌: $e");
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text("Peyk-D Emergency (Port 53)")),
-      body: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          children: [
-            TextField(
-              controller: _controller,
-              decoration: const InputDecoration(
-                labelText: "Enter Message",
-                border: OutlineInputBorder(),
-              ),
+      appBar: AppBar(
+        title: const Text("Peyk-D Secure Chat", style: TextStyle(color: Colors.white)),
+        centerTitle: false, // فضای بیشتر برای آیکون‌ها
+        backgroundColor: Colors.blueGrey[900],
+        elevation: 4,
+        actions: [
+          // دکمه تنظیمات که حالا به درستی نمایش داده می‌شود
+          IconButton(
+            icon: const Icon(Icons.settings, color: Colors.white, size: 28),
+            onPressed: _showSettingsDialog,
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: ListView.builder(
+              reverse: true,
+              itemCount: _messages.length,
+              itemBuilder: (context, index) {
+                return Align(
+                  alignment: Alignment.centerRight,
+                  child: Container(
+                    margin: const EdgeInsets.symmetric(vertical: 5, horizontal: 10),
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.blueGrey[700],
+                      borderRadius: const BorderRadius.only(
+                        topLeft: Radius.circular(15),
+                        topRight: Radius.circular(15),
+                        bottomLeft: Radius.circular(15),
+                      ),
+                    ),
+                    child: Text(_messages[index]["text"]!, style: const TextStyle(color: Colors.white)),
+                  ),
+                );
+              },
             ),
-            const SizedBox(height: 20),
-            ElevatedButton(
-              onPressed: () => sendDnsMessage(_controller.text),
-              style: ElevatedButton.styleFrom(
-                minimumSize: const Size.fromHeight(50),
-              ),
-              child: const Text("Send via DNS (UDP)"),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(8.0),
+            child: Text(_status, style: const TextStyle(fontSize: 12, color: Colors.grey)),
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(color: Colors.white, boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 4)]),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _controller,
+                    decoration: const InputDecoration(hintText: "Type a message...", border: InputBorder.none),
+                  ),
+                ),
+                IconButton(icon: const Icon(Icons.send, color: Colors.blueGrey), onPressed: _sendMessage),
+              ],
             ),
-            const SizedBox(height: 20),
-            Container(
-              padding: const EdgeInsets.all(10),
-              color: Colors.grey[200],
-              width: double.infinity,
-              child: Text(
-                "Status: $_status",
-                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
-              ),
-            ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
