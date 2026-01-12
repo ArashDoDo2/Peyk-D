@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:typed_data'; // حتماً این خط را اضافه کنید
 import 'package:flutter/material.dart';
 import 'package:base32/base32.dart';
+import 'package:encrypt/encrypt.dart' as enc;
 
 void main() {
   runApp(const PeykDApp());
@@ -33,37 +34,42 @@ class _MessageScreenState extends State<MessageScreen> {
   String _status = "Ready to send";
 
   // تابع ارسال پکت واقعی UDP به سمت کامپیوتر
-  void sendDnsMessage(String message) async {
+void sendDnsMessage(String message) async {
   if (message.isEmpty) return;
 
   try {
-    const String hostIP = "10.0.2.2"; 
-    const int port = 53; 
+    // ۱. تنظیم کلید و IV (باید دقیقا با سرور یکی باشد)
+    final key = enc.Key.fromUtf8('my32characterslongsecretkey12345'); // ۳۲ کاراکتر
+    final iv = enc.IV.fromUtf8('1212312312312312'); // ۱۶ کاراکتر
+    final encrypter = enc.Encrypter(enc.AES(key, mode: enc.AESMode.cbc));
 
-    // ۱. تبدیل متن به بایت‌های UTF-8 (برای پشتیبانی از فارسی)
-    List<int> messageBytes = utf8.encode(message);
+    // ۲. رمزنگاری متن اصلی
+    final encrypted = encrypter.encrypt(message, iv: iv);
+    String encryptedString = encrypted.base64; // ابتدا به بیس ۶۴ تبدیل میکنیم تا راحت تر جابجا شود
 
-    // ۲. کدگذاری به Base32
-    String encoded = base32.encode(Uint8List.fromList(messageBytes));
-    
-    // ۳. حذف علامت '=' (Padding) چون در DNS مجاز نیست و کوچک کردن حروف
-    String dnsSafePayload = encoded.replaceAll('=', '').toLowerCase();
-    
-    // ۴. ساخت ساب‌دامنه نهایی
-    String fullDomain = "$dnsSafePayload.p99.peyk-d.ir";
+    // ۳. تبدیل خروجی رمز شده به Base32 (برای عبور از DNS)
+    List<int> encryptedBytes = utf8.encode(encryptedString);
+    String dnsSafePayload = base32.encode(Uint8List.fromList(encryptedBytes)).replaceAll('=', '').toLowerCase();
 
-    RawDatagramSocket.bind(InternetAddress.anyIPv4, 0).then((RawDatagramSocket socket) {
-      socket.send(utf8.encode(fullDomain), InternetAddress(hostIP), port);
-      socket.close();
+    // ۴. تقسیم به تکه‌های ۵۰ کاراکتری و ارسال (همان منطق فاز ۲)
+    int chunkSize = 50;
+    for (var i = 0; i < dnsSafePayload.length; i += chunkSize) {
+      String chunk = dnsSafePayload.substring(i, i + chunkSize > dnsSafePayload.length ? dnsSafePayload.length : i + chunkSize);
+      int index = (i / chunkSize).floor() + 1;
+      int total = (dnsSafePayload.length / chunkSize).ceil();
       
-      setState(() {
-        _status = "✅ Encoded & Sent: $fullDomain";
+      String packet = "$index-$total-$chunk.p99.peyk-d.ir";
+      
+      RawDatagramSocket.bind(InternetAddress.anyIPv4, 0).then((socket) {
+        socket.send(utf8.encode(packet), InternetAddress("10.0.2.2"), 53);
+        socket.close();
       });
-    });
+      await Future.delayed(Duration(milliseconds: 100));
+    }
+
+    setState(() { _status = "🔐 Encrypted & Sent in ${(dnsSafePayload.length / chunkSize).ceil()} chunks"; });
   } catch (e) {
-    setState(() {
-      _status = "❌ Error: $e";
-    });
+    setState(() { _status = "❌ Encryption Error: $e"; });
   }
 }
 

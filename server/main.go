@@ -1,64 +1,71 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/base32"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"strings"
 )
 
-// محلی برای ذخیره تکه‌های پیام (در نسخه نهایی از دیتابیس یا Map استفاده می‌کنیم)
+var (
+	key = []byte("my32characterslongsecretkey12345") // ۳۲ کاراکتر (باید با کلاینت یکی باشد)
+	iv  = []byte("1212312312312312")                 // ۱۶ کاراکتر
+)
+
 var messageBuffer = make(map[string]string)
 
 func main() {
 	addr, _ := net.ResolveUDPAddr("udp", ":53")
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
-	}
+	conn, _ := net.ListenUDP("udp", addr)
 	defer conn.Close()
 
-	fmt.Println("🚀 Peyk-D Server (Phase 2: Chunking) Listening...")
+	fmt.Println("🚀 Peyk-D Secure Server (Phase 3: AES) Listening...")
 
 	buf := make([]byte, 1024)
 	for {
-		n, remoteAddr, _ := conn.ReadFromUDP(buf)
-		raw := string(buf[:n])
-
-		// جدا کردن اجزا: [index]-[total]-[payload]
-		parts := strings.Split(raw, "-")
+		n, _, _ := conn.ReadFromUDP(buf)
+		parts := strings.Split(string(buf[:n]), "-")
 		if len(parts) < 3 {
 			continue
 		}
 
-		index := parts[0]
-		total := parts[1]
+		index, total := parts[0], parts[1]
 		payload := strings.Split(parts[2], ".")[0]
-
-		fmt.Printf("📦 Received chunk %s/%s from %s\n", index, total, remoteAddr)
-
-		// چسباندن موقت (در فاز ساده فعلی)
 		messageBuffer[index] = payload
 
-		// اگر تمام تکه‌ها رسیدند (ساده‌سازی شده برای تست)
 		if index == total {
-			fullEncoded := ""
-			for i := 1; i <= len(messageBuffer); i++ {
-				fullEncoded += messageBuffer[fmt.Sprint(i)]
+			// ۱. بازسازی Base32
+			fullB32 := strings.ToUpper(strings.Join(assemble(messageBuffer, total), ""))
+			for len(fullB32)%8 != 0 {
+				fullB32 += "="
 			}
+			encryptedBase64, _ := base32.StdEncoding.DecodeString(fullB32)
 
-			// بازسازی برای Decode
-			fullEncoded = strings.ToUpper(fullEncoded)
-			for len(fullEncoded)%8 != 0 {
-				fullEncoded += "="
-			}
+			// ۲. رمزگشایی AES
+			block, _ := aes.NewCipher(key)
+			mode := cipher.NewCBCDecrypter(block, iv)
 
-			decoded, _ := base32.StdEncoding.DecodeString(fullEncoded)
-			fmt.Printf("\n✨ COMPLETE MESSAGE: %s\n\n", string(decoded))
+			ciphertext, _ := base64.StdEncoding.DecodeString(string(encryptedBase64))
+			decrypted := make([]byte, len(ciphertext))
+			mode.CryptBlocks(decrypted, ciphertext)
 
-			// خالی کردن بافر برای پیام بعدی
+			// ۳. حذف Padding (در AES بلاک‌ها باید ۱۶ بایتی باشند)
+			finalMsg := strings.TrimSpace(string(decrypted))
+			fmt.Printf("\n🔓 Decrypted Secure Message: %s\n", finalMsg)
 			messageBuffer = make(map[string]string)
 		}
 	}
+}
+
+func assemble(m map[string]string, total string) []string {
+	var res []string
+	for i := 1; i <= 20; i++ { // فرض برای تست
+		if val, ok := m[fmt.Sprint(i)]; ok {
+			res = append(res, val)
+		}
+	}
+	return res
 }
