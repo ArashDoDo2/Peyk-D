@@ -2,34 +2,64 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base32"
-	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	SERVER_ADDR = "127.0.0.1:53"
-	BASE_DOMAIN = "p99.peyk-d.ir"
+	BASE_DOMAIN = "p99.online.ir"
 	PASSPHRASE  = "my-fixed-passphrase-change-me"
 
-	MY_ID     = "simul" // simulator id (receiver in polling)
-	TARGET_ID = "a3akc" // mobile id
+	MY_ID     = "simul"
+	TARGET_ID = "a3akc"
 )
 
-var buffers = make(map[string]map[int]string)
+// RX buffers: key = "sid-rid-tot" -> idx->payload
+var (
+	buffers   = make(map[string]map[int]string)
+	buffersMu sync.Mutex
+)
+
+// Dedup store: key = "sid:<hash>" with TTL (prevents false duplicate based on tot)
+var (
+	seenMu     sync.Mutex
+	seenHashAt = make(map[string]time.Time)
+	seenTTL    = 10 * time.Minute
+)
+
+// ✅ Peyk latency metrics (TX start → ACK2 received)
+// key = "<sid>:<tot>"  (sid is sender; for our outgoing messages sid=MY_ID)
+var (
+	txMu      sync.Mutex
+	txStartAt = make(map[string]time.Time)
+)
+
+// IPv4-only resolver to avoid Windows AAAA timeout (~10s)
+var resolver4 = &net.Resolver{
+	PreferGo: true,
+	Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		d := net.Dialer{Timeout: 1200 * time.Millisecond}
+		return d.DialContext(ctx, "udp4", address)
+	},
+}
 
 func main() {
-	fmt.Println("🚀 Peyk Simulator Pro Started...")
+	fmt.Println("🚀 Peyk Simulator Pro [RECURSIVE MODE - IPv4 ONLY] Started...")
 	fmt.Printf("🆔 My ID: %s | 🎯 Target ID: %s\n", MY_ID, TARGET_ID)
+	fmt.Println("🌐 Using system recursive DNS, forced IPv4 to avoid AAAA delays.")
 	fmt.Println("--------------------------------------------------")
 
 	go startPolling()
@@ -44,58 +74,96 @@ func main() {
 	}
 }
 
-// ───────────────────────── POLLING ─────────────────────────
+// ───────────────────────── POLLING (RX) ─────────────────────────
 
 func startPolling() {
+	const (
+		fastDelay   = 350 * time.Millisecond
+		minBackoff  = 1500 * time.Millisecond
+		maxBackoff  = 5 * time.Second
+		backoffStep = 1.5
+	)
+
+	backoff := minBackoff
+
 	for {
-		hasMore := true
-		for hasMore {
-			queryStr := fmt.Sprintf("v1.sync.%s.%s", MY_ID, BASE_DOMAIN)
+		queryStr := fmt.Sprintf("v1.sync.%s.%s", MY_ID, BASE_DOMAIN)
 
-			// IMPORTANT: polling must be TXT query (QTYPE=16)
-			packet := buildDnsQuery(queryStr, 16)
+		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		txts, err := resolver4.LookupTXT(ctx, queryStr)
+		cancel()
 
-			conn, err := net.Dial("udp", SERVER_ADDR)
-			if err != nil {
-				hasMore = false
-				continue
+		if err != nil || len(txts) == 0 {
+			time.Sleep(backoff)
+			backoff = time.Duration(float64(backoff) * backoffStep)
+			if backoff > maxBackoff {
+				backoff = maxBackoff
 			}
-
-			_, _ = conn.Write(packet)
-
-			buffer := make([]byte, 1024)
-			_ = conn.SetReadDeadline(time.Now().Add(1200 * time.Millisecond))
-			n, err := conn.Read(buffer)
-			_ = conn.Close()
-
-			if err != nil || n <= 0 {
-				hasMore = false
-				continue
-			}
-
-			txt := extractTxt(buffer[:n])
-			if txt == "" || txt == "NOP" {
-				hasMore = false
-				continue
-			}
-
-			// ACK2 for sender might appear as TXT (if you are also sender)
-			if strings.HasPrefix(txt, "ACK2-") {
-				fmt.Println("✅ [ACK2 RECEIVED]", txt)
-				hasMore = true
-				continue
-			}
-
-			handleIncomingChunk(txt)
-			hasMore = true
-			time.Sleep(200 * time.Millisecond)
+			continue
 		}
 
-		time.Sleep(2 * time.Second)
+		txt := txts[0]
+		if txt == "" || txt == "NOP" {
+			time.Sleep(backoff)
+			backoff = time.Duration(float64(backoff) * backoffStep)
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		backoff = minBackoff
+
+		if strings.HasPrefix(txt, "ACK2-") {
+			fmt.Println("✅ [ACK2 RECEIVED]", txt)
+			handleAck2Metric(txt) // ✅ Peyk latency metric
+		} else {
+			handleIncomingChunk(txt)
+		}
+
+		time.Sleep(fastDelay)
 	}
 }
 
-// ───────────────────────── RX ─────────────────────────
+// ✅ Parse ACK2 and compute Peyk latency if it's for our outgoing message
+func handleAck2Metric(txt string) {
+	// format: ACK2-<sid>-<tot>
+	parts := strings.Split(txt, "-")
+	if len(parts) != 3 {
+		return
+	}
+
+	sid := strings.ToLower(parts[1])
+	tot, err := strconv.Atoi(parts[2])
+	if err != nil || tot <= 0 {
+		return
+	}
+
+	// Only measure latency for ACK2s that confirm messages WE sent.
+	// (Those have sid == MY_ID)
+	if sid != strings.ToLower(MY_ID) {
+		return
+	}
+
+	key := fmt.Sprintf("%s:%d", sid, tot)
+
+	txMu.Lock()
+	start, ok := txStartAt[key]
+	if ok {
+		delete(txStartAt, key)
+	}
+	txMu.Unlock()
+
+	if !ok {
+		// no start time recorded (maybe old ACK2 or collision)
+		return
+	}
+
+	lat := time.Since(start)
+	fmt.Printf("📊 PEYK_LATENCY sid=%s tot=%d latency=%s\n", sid, tot, lat.Round(time.Millisecond))
+}
+
+// ───────────────────────── RX CHUNKS ─────────────────────────
 
 func handleIncomingChunk(txt string) {
 	parts := strings.Split(txt, "-")
@@ -104,8 +172,12 @@ func handleIncomingChunk(txt string) {
 	}
 
 	var idx, total int
-	fmt.Sscanf(parts[0], "%d", &idx)
-	fmt.Sscanf(parts[1], "%d", &total)
+	if _, err := fmt.Sscanf(parts[0], "%d", &idx); err != nil {
+		return
+	}
+	if _, err := fmt.Sscanf(parts[1], "%d", &total); err != nil {
+		return
+	}
 
 	senderID := strings.ToLower(parts[2])
 	receiverID := strings.ToLower(parts[3])
@@ -114,29 +186,66 @@ func handleIncomingChunk(txt string) {
 	if receiverID != strings.ToLower(MY_ID) {
 		return
 	}
+	if idx <= 0 || total <= 0 || idx > total || payload == "" {
+		return
+	}
 
 	key := fmt.Sprintf("%s-%s-%d", senderID, receiverID, total)
+
+	buffersMu.Lock()
 	if _, ok := buffers[key]; !ok {
 		buffers[key] = make(map[int]string)
 	}
 	buffers[key][idx] = payload
+	got := len(buffers[key])
+	buffersMu.Unlock()
 
-	fmt.Printf("📦 [RX] Chunk %d/%d from %s\n", idx, total, senderID)
+	fmt.Printf("📦 [RX] Chunk %d/%d from %s (have %d/%d)\n", idx, total, senderID, got, total)
 
-	if len(buffers[key]) == total {
+	if got == total {
 		assembleAndDecrypt(key, total, senderID)
 	}
 }
 
 func assembleAndDecrypt(key string, total int, senderID string) {
+	// copy out under lock
+	buffersMu.Lock()
+	chunks, ok := buffers[key]
+	if !ok {
+		buffersMu.Unlock()
+		return
+	}
+	for i := 1; i <= total; i++ {
+		if _, exists := chunks[i]; !exists {
+			buffersMu.Unlock()
+			return
+		}
+	}
+
 	var sb strings.Builder
 	for i := 1; i <= total; i++ {
-		sb.WriteString(buffers[key][i])
+		sb.WriteString(chunks[i])
 	}
-	fullB32 := sb.String()
-	delete(buffers, key)
 
-	raw, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(fullB32))
+	delete(buffers, key)
+	buffersMu.Unlock()
+
+	fullB32 := sb.String()
+
+	// ✅ Dedup correctly: hash of message content (not sid:tot)
+	msgHash := sha256.Sum256([]byte(fullB32))
+	hashHex := hex.EncodeToString(msgHash[:8])
+	dupKey := fmt.Sprintf("%s:%s", senderID, hashHex)
+
+	if isDuplicateAndMark(dupKey) {
+		fmt.Printf("🔁 DUPLICATE (content-hash) ignored %s\n", dupKey)
+		// Still ACK2 (best-effort) to help sender stop resending
+		go retryAck2Stable(senderID, total)
+		return
+	}
+
+	raw, err := base32.StdEncoding.WithPadding(base32.NoPadding).
+		DecodeString(strings.ToUpper(fullB32))
 	if err != nil {
 		fmt.Printf("❌ Base32 Error: %v\n", err)
 		return
@@ -150,31 +259,50 @@ func assembleAndDecrypt(key string, total int, senderID string) {
 
 	fmt.Printf("\n📩 NEW MESSAGE [%s]: %s\n\n", senderID, decrypted)
 
-	// IMPORTANT: send ACK2 back to server so sender gets ✓✓
-	sendAck2(senderID, total)
+	// ACK2 (stable format: ack2-sid-tot)
+	go retryAck2Stable(senderID, total)
 }
 
-func sendAck2(senderID string, total int) {
-	// ack2-<sid>-<tot>.<base>  (sid is original sender)
-	domain := fmt.Sprintf("ack2-%s-%d.%s", strings.ToLower(senderID), total, BASE_DOMAIN)
-	q := buildDnsQuery(domain, 1) // ACK2 is A-query
+// Dedup with TTL cleanup
+func isDuplicateAndMark(k string) bool {
+	now := time.Now()
 
-	conn, err := net.Dial("udp", SERVER_ADDR)
-	if err != nil {
-		return
+	seenMu.Lock()
+	defer seenMu.Unlock()
+
+	for kk, t := range seenHashAt {
+		if now.Sub(t) > seenTTL {
+			delete(seenHashAt, kk)
+		}
 	}
-	defer conn.Close()
 
-	_, _ = conn.Write(q)
-	// optional: read server ACK (not required)
-	_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-	tmp := make([]byte, 512)
-	_, _ = conn.Read(tmp)
+	if t, ok := seenHashAt[k]; ok && now.Sub(t) <= seenTTL {
+		return true
+	}
 
-	fmt.Printf("✅ Sent ACK2 for %s/%d\n", senderID, total)
+	seenHashAt[k] = now
+	return false
 }
 
-// ───────────────────────── TX (sending) ─────────────────────────
+// ───────────────────────── ACK2 (Stable) ─────────────────────────
+//
+// Send "ack2-<sid>-<tot>.<base>" (no RID) — matches stable server.
+// Retry a few times (best-effort) because recursive DNS can drop.
+
+func retryAck2Stable(senderID string, total int) {
+	domain := fmt.Sprintf("ack2-%s-%d.%s", strings.ToLower(senderID), total, BASE_DOMAIN)
+
+	for i := 0; i < 3; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		_, _ = resolver4.LookupIP(ctx, "ip4", domain)
+		cancel()
+		time.Sleep(350 * time.Millisecond)
+	}
+
+	fmt.Printf("📨 ACK2 sent for %s/%d (stable)\n", senderID, total)
+}
+
+// ───────────────────────── TX (Send) ─────────────────────────
 
 func sendManualMessage(msg string) {
 	hash := sha256.Sum256([]byte(PASSPHRASE))
@@ -187,15 +315,30 @@ func sendManualMessage(msg string) {
 	_, _ = io.ReadFull(rand.Reader, nonce)
 
 	encrypted := aesgcm.Seal(nil, nonce, []byte(msg), nil)
-	fullData := append(nonce, encrypted...) // nonce + ciphertext+tag
+	fullData := append(nonce, encrypted...)
 
-	encoded := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(fullData))
-	sendChunks(encoded)
+	encoded := strings.ToLower(
+		base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(fullData),
+	)
+
+	sendChunksRecursive(encoded)
 }
 
-func sendChunks(data string) {
+func sendChunksRecursive(data string) {
 	chunkSize := 45
 	total := (len(data) + chunkSize - 1) / chunkSize
+
+	// ✅ record Peyk TX start time for latency metric
+	// key is "<MY_ID>:<tot>", matching server ACK2 format: ACK2-<sid>-<tot>
+	txKey := fmt.Sprintf("%s:%d", strings.ToLower(MY_ID), total)
+	txMu.Lock()
+	txStartAt[txKey] = time.Now()
+	txMu.Unlock()
+
+	const (
+		fastPace = 200 * time.Millisecond
+		slowPace = 900 * time.Millisecond
+	)
 
 	for i := 0; i < total; i++ {
 		start := i * chunkSize
@@ -205,31 +348,24 @@ func sendChunks(data string) {
 		}
 
 		label := fmt.Sprintf("%d-%d-%s-%s-%s", i+1, total, MY_ID, TARGET_ID, data[start:end])
-		query := buildDnsQuery(label+"."+BASE_DOMAIN, 1) // send chunks as A query
+		host := label + "." + BASE_DOMAIN
 
-		conn, err := net.Dial("udp", SERVER_ADDR)
-		if err != nil {
-			fmt.Println("❌ Network Error:", err)
-			return
-		}
-
-		_, _ = conn.Write(query)
-
-		// optional: read server ACK (✓)
-		ackBuffer := make([]byte, 512)
-		_ = conn.SetReadDeadline(time.Now().Add(1200 * time.Millisecond))
-		_, err = conn.Read(ackBuffer)
-		_ = conn.Close()
+		startTime := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		_, err := resolver4.LookupIP(ctx, "ip4", host)
+		cancel()
+		rtt := time.Since(startTime)
 
 		if err != nil {
-			fmt.Printf("⚠️ [TX] Chunk %d/%d - No Server ACK\n", i+1, total)
+			fmt.Printf("⚠️ [TX] Chunk %d/%d - SENT (ip4 err after %v)\n", i+1, total, rtt.Round(time.Millisecond))
+			time.Sleep(slowPace)
 		} else {
-			fmt.Printf("📤 [TX] Chunk %d/%d - Server ACK ✓\n", i+1, total)
+			fmt.Printf("📤 [TX] Chunk %d/%d - SENT (ip4 RTT: %v)\n", i+1, total, rtt.Round(time.Millisecond))
+			time.Sleep(fastPace)
 		}
-
-		time.Sleep(120 * time.Millisecond)
 	}
-	fmt.Println("✅ Message Transmission Finished.")
+
+	fmt.Println("✅ Message SENT.")
 }
 
 // ───────────────────────── Crypto ─────────────────────────
@@ -246,116 +382,8 @@ func decrypt(data []byte) (string, error) {
 	}
 
 	nonce := data[:12]
-	ciphertextWithTag := data[12:]
+	ciphertext := data[12:]
 
-	plaintext, err := aesgcm.Open(nil, nonce, ciphertextWithTag, nil)
-	return string(plaintext), err
-}
-
-// ───────────────────────── DNS: build query with qtype ─────────────────────────
-
-func buildDnsQuery(domain string, qtype uint16) []byte {
-	// Header: ID(2), Flags(2), QDCOUNT(2), AN/NS/AR(2 each)
-	packet := []byte{
-		0xAB, 0xCD,
-		0x01, 0x00,
-		0x00, 0x01,
-		0x00, 0x00,
-		0x00, 0x00,
-		0x00, 0x00,
-	}
-
-	for _, label := range strings.Split(domain, ".") {
-		if label == "" {
-			continue
-		}
-		packet = append(packet, byte(len(label)))
-		packet = append(packet, []byte(label)...)
-	}
-	packet = append(packet, 0x00)
-
-	qt := make([]byte, 2)
-	binary.BigEndian.PutUint16(qt, qtype)
-	packet = append(packet, qt...)
-
-	// QCLASS IN
-	packet = append(packet, 0x00, 0x01)
-	return packet
-}
-
-// ───────────────────────── DNS: extract TXT properly ─────────────────────────
-
-func extractTxt(msg []byte) string {
-	// minimal DNS TXT extractor (single answer is enough)
-	if len(msg) < 12 {
-		return ""
-	}
-
-	i := 12
-
-	// skip QNAME
-	for i < len(msg) {
-		if msg[i] == 0x00 {
-			i++
-			break
-		}
-		l := int(msg[i])
-		if l == 0 || i+1+l > len(msg) {
-			return ""
-		}
-		i += 1 + l
-	}
-
-	// skip QTYPE/QCLASS
-	if i+4 > len(msg) {
-		return ""
-	}
-	i += 4
-
-	// parse answers
-	for i+10 <= len(msg) {
-		// NAME
-		if (msg[i] & 0xC0) == 0xC0 {
-			i += 2
-		} else {
-			for i < len(msg) && msg[i] != 0x00 {
-				i += 1 + int(msg[i])
-			}
-			i++
-		}
-		if i+10 > len(msg) {
-			return ""
-		}
-
-		typ := binary.BigEndian.Uint16(msg[i : i+2])
-		i += 2
-		_ = binary.BigEndian.Uint16(msg[i : i+2]) // class
-		i += 2
-		i += 4 // ttl
-
-		rdLen := int(binary.BigEndian.Uint16(msg[i : i+2]))
-		i += 2
-		if i+rdLen > len(msg) {
-			return ""
-		}
-
-		if typ == 16 && rdLen >= 1 { // TXT
-			end := i + rdLen
-			j := i
-			var out strings.Builder
-			for j < end {
-				l := int(msg[j])
-				j++
-				if j+l > end {
-					break
-				}
-				out.Write(msg[j : j+l])
-				j += l
-			}
-			return strings.TrimSpace(out.String())
-		}
-
-		i += rdLen
-	}
-	return ""
+	plain, err := aesgcm.Open(nil, nonce, ciphertext, nil)
+	return string(plain), err
 }

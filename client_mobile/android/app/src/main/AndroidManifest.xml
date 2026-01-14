@@ -2,6 +2,9 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:label="Peyk Messenger" 
@@ -9,6 +12,7 @@
         android:icon="@mipmap/ic_launcher">
         
         <activity
+            android:showOnLockScreen="true"
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
@@ -28,6 +32,14 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <service
+            android:name="com.dexterous.flutter_local_notifications.ForegroundService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false">
+            <property 
+                android:name="android.app.PROPERTY_SPECIAL_USE_CATEGORY" 
+                android:value="dns_tunneling_communication"/>
+        </service>     
 
         <meta-data
             android:name="flutterEmbedding"

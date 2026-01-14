@@ -1,13 +1,14 @@
 plugins {
     id("com.android.application")
     id("kotlin-android")
-    // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
 }
 
 android {
     namespace = "com.example.client_mobile"
-    compileSdk = flutter.compileSdkVersion
+    
+    // ارتقا به 36 برای سازگاری با پکیج‌های جدید (مثل Secure Storage)
+    compileSdk = 36 
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
@@ -16,25 +17,28 @@ android {
     }
 
     kotlinOptions {
-        jvmTarget = JavaVersion.VERSION_17.toString()
+        jvmTarget = "17"
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "com.example.client_mobile"
-        // You can update the following values to match your application needs.
-        // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
-        targetSdk = flutter.targetSdkVersion
+        
+        minSdk = 24 
+        // هدف اصلی شما همچنان اندروید ۱۴ است
+        targetSdk = 34 
+        
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }
 
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
+            // استفاده از تنظیمات دیباگ برای تست سریع روی گوشی دیگران
             signingConfig = signingConfigs.getByName("debug")
+            
+            // غیرفعال کردن Minify برای جلوگیری از حذف کدهای Go (Gomobile)
+            isMinifyEnabled = false
+            isShrinkResources = false
         }
     }
 }

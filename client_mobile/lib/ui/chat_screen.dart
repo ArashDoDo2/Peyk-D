@@ -5,7 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:base32/base32.dart';
 
-// Import core layers
+// Core layers
 import '../core/protocol.dart';
 import '../core/crypto.dart';
 import '../core/dns_codec.dart';
@@ -14,6 +14,18 @@ import '../core/transport.dart';
 import '../utils/id.dart';
 
 enum NodeStatus { idle, polling, sending, success, error }
+
+class _RxBufferState {
+  final RxAssembly asm;
+  DateTime createdAt;
+  DateTime lastUpdatedAt;
+  bool hasIdx1;
+
+  _RxBufferState(this.asm)
+      : createdAt = DateTime.now(),
+        lastUpdatedAt = DateTime.now(),
+        hasIdx1 = false;
+}
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key});
@@ -26,13 +38,15 @@ class _ChatScreenState extends State<ChatScreen>
     with SingleTickerProviderStateMixin {
   final TextEditingController _controller = TextEditingController();
   final List<Map<String, dynamic>> _messages = [];
-  final Map<String, RxAssembly> _buffers = {};
 
-  /// For ✓✓ mapping (sender side)
-  /// key = "<sid>:<tot>"  where sid is me (sender id)
+  /// RX buffers keyed by "<sid>:<rid>:<tot>"
+  final Map<String, _RxBufferState> _buffers = {};
+
+  /// ✓✓ mapping (sender side)
+  /// key = "<sid>:<tot>"
   final Map<String, int> _pendingDelivery = {};
 
-  // Settings Variables
+  // Settings
   String _myID = '';
   String _targetID = '';
   String _serverIP = PeykProtocol.defaultServerIP;
@@ -48,6 +62,9 @@ class _ChatScreenState extends State<ChatScreen>
   Timer? _pollTimer;
   late AnimationController _glowCtrl;
   late Animation<double> _glowAnim;
+
+  // Buffer TTL (برای جلوگیری از گیرکردن پیام‌های ناقص)
+  static const Duration _bufferTtl = Duration(seconds: 90);
 
   @override
   void initState() {
@@ -80,19 +97,21 @@ class _ChatScreenState extends State<ChatScreen>
       _pollingEnabled = prefs.getBool('polling_enabled') ?? true;
       _debugMode = prefs.getBool('debug_mode') ?? false;
 
-      if (prefs.getString('my_id') == null) prefs.setString('my_id', _myID);
+      if (prefs.getString('my_id') == null) {
+        prefs.setString('my_id', _myID);
+      }
     });
     _startPolling();
   }
 
   // ───────────────────────── SEND ─────────────────────────
+
   void _sendMessage() async {
     final text = _controller.text.trim();
     if (text.isEmpty || !IdUtils.isValid(_targetID)) return;
 
     _controller.clear();
 
-    // UI: insert message immediately
     setState(() {
       _messages.insert(0, {
         "text": text,
@@ -102,7 +121,7 @@ class _ChatScreenState extends State<ChatScreen>
       _status = NodeStatus.sending;
     });
 
-    final int messageIndex = 0; // چون insert(0) کردیم
+    final int messageIndex = 0;
 
     try {
       final encrypted = await PeykCrypto.encrypt(text);
@@ -111,14 +130,9 @@ class _ChatScreenState extends State<ChatScreen>
 
       final transport = DnsTransport(_serverIP);
 
-      // 🔑 کلیدی که با ACK2 سرور match می‌شود
-      // server => ACK2-<sid>-<tot>
       final ackKey = "$_myID:${chunks.length}";
-
-      // ذخیره برای ✓✓
       _pendingDelivery[ackKey] = messageIndex;
 
-      // ✓ = server received
       setState(() {
         _messages[messageIndex]["status"] = "sent";
       });
@@ -149,9 +163,7 @@ class _ChatScreenState extends State<ChatScreen>
     );
   }
 
-
   List<String> _makeChunks(String data) {
-    // keep your original chunk size
     const int size = 30;
     final List<String> chunks = [];
     for (var i = 0; i < data.length; i += size) {
@@ -161,24 +173,40 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   // ───────────────────────── POLLING ─────────────────────────
+
   void _startPolling() {
     _pollTimer?.cancel();
     if (!_pollingEnabled) return;
 
     _pollTimer = Timer.periodic(
       Duration(
-        seconds: _pollMin + Random().nextInt(max(1, _pollMax - _pollMin + 1)),
+        seconds: _pollMin +
+            Random().nextInt(max(1, _pollMax - _pollMin + 1)),
       ),
-      (timer) async {
-        await _fetchBuffer();
-      },
+      (_) => _fetchBuffer(),
     );
   }
 
-  // Drain server queue fast
+  void _gcBuffers() {
+    if (_buffers.isEmpty) return;
+    final now = DateTime.now();
+    final toRemove = <String>[];
+    _buffers.forEach((k, st) {
+      if (now.difference(st.lastUpdatedAt) > _bufferTtl) {
+        toRemove.add(k);
+      }
+    });
+    for (final k in toRemove) {
+      if (_debugMode) print("DEBUG: GC buffer $k (stale)");
+      _buffers.remove(k);
+    }
+  }
+
   Future<void> _fetchBuffer() async {
     if (_status != NodeStatus.idle && _status != NodeStatus.polling) return;
     setState(() => _status = NodeStatus.polling);
+
+    _gcBuffers();
 
     final transport = DnsTransport(_serverIP);
     bool hasMore = true;
@@ -186,27 +214,17 @@ class _ChatScreenState extends State<ChatScreen>
     while (hasMore) {
       final query = DnsCodec.buildQuery(
         "v1.sync.$_myID.$_baseDomain",
-        qtype: PeykProtocol.qtypeTXT, // IMPORTANT: polling must be TXT
+        qtype: PeykProtocol.qtypeTXT,
       );
 
       final response = await transport.sendAndReceive(query);
-
-      if (response == null) {
-        hasMore = false;
-        break;
-      }
+      if (response == null) break;
 
       final txt = DnsCodec.extractTxt(response);
-      if (txt == null || txt == "NOP") {
-        hasMore = false;
-        break;
-      }
+      if (txt == null || txt == "NOP") break;
 
-      if (_debugMode) {
-        print("DEBUG: POLL TXT => $txt");
-      }
+      if (_debugMode) print("DEBUG POLL => $txt");
 
-      // ✅ Fix regression: ACK2 must not go through chunk parser
       if (txt.startsWith("ACK2-")) {
         _handleDeliveryAck(txt);
         await Future.delayed(const Duration(milliseconds: 200));
@@ -220,28 +238,24 @@ class _ChatScreenState extends State<ChatScreen>
     setState(() => _status = NodeStatus.idle);
   }
 
-  // Handle ✓✓ from server for messages we sent
   void _handleDeliveryAck(String txt) {
     final parts = txt.split("-");
     if (parts.length != 3) return;
 
-    final sid = parts[1];
-    final tot = parts[2];
-    final key = "$sid:$tot";
-
+    final key = "${parts[1]}:${parts[2]}";
     final idx = _pendingDelivery[key];
     if (idx != null && idx < _messages.length) {
       setState(() {
-        _messages[idx]["status"] = "delivered"; // ✓✓
+        _messages[idx]["status"] = "delivered";
       });
       _pendingDelivery.remove(key);
     }
   }
 
-  // ───────────────────────── RX CHUNKS ─────────────────────────
+  // ───────────────────────── RX ─────────────────────────
+
   void _handleIncomingChunk(String txt) async {
     try {
-      // format: idx-tot-sid-rid-payload
       final parts = txt.split('-');
       if (parts.length < 5) return;
 
@@ -251,32 +265,66 @@ class _ChatScreenState extends State<ChatScreen>
       final rid = parts[3];
       final payload = parts.sublist(4).join('-');
 
-      // accept only if for us
       if (rid != _myID) return;
+      if (idx <= 0 || tot <= 0 || idx > tot) return;
+      if (payload.isEmpty) return;
 
-      final key = "$sid:$rid:$tot";
-      _buffers.putIfAbsent(key, () => RxAssembly(sid, tot));
-      _buffers[key]!.addPart(idx, payload);
+      final bufKey = "$sid:$rid:$tot";
 
-      if (_debugMode) {
-        print("DEBUG: Received Chunk $idx/$tot from $sid");
+      // اگر chunk1 جدید رسید ولی قبلاً یک بافر نیمه‌کاره برای همین (sid,rid,tot) داشتیم،
+      // این یعنی پیام جدید احتمالاً با همان tot آمده و کلید collision می‌دهد.
+      // برای server-stable بهترین رفتار این است: بافر قبلی را reset کنیم تا پیام جدید گیر نکند.
+      final existing = _buffers[bufKey];
+      if (idx == 1 && existing != null && !existing.asm.isComplete) {
+        if (_debugMode) {
+          print(
+              "DEBUG: Resetting stale/inflight buffer due to new idx=1 for same key $bufKey");
+        }
+        _buffers.remove(bufKey);
       }
 
-      if (_buffers[key]!.isComplete) {
-        final fullB32 = _buffers[key]!.assemble();
-        _buffers.remove(key);
+      final st = _buffers.putIfAbsent(bufKey, () => _RxBufferState(RxAssembly(sid, tot)));
+      st.lastUpdatedAt = DateTime.now();
+      if (idx == 1) st.hasIdx1 = true;
+
+      st.asm.addPart(idx, payload);
+
+      if (st.asm.isComplete) {
+        final fullB32 = st.asm.assemble();
+        _buffers.remove(bufKey);
 
         // normalize base32 for decoder
-        String readyToDecode = fullB32.toUpperCase();
-        while (readyToDecode.length % 8 != 0) {
-          readyToDecode += '=';
+        String normalized = fullB32.toUpperCase();
+        while (normalized.length % 8 != 0) {
+          normalized += '=';
         }
 
-        final Uint8List decodedBytes =
-            Uint8List.fromList(base32.decode(readyToDecode));
+        Uint8List decoded;
+        try {
+          decoded = Uint8List.fromList(base32.decode(normalized));
+        } catch (e) {
+          // این دقیقاً یکی از علت‌های «می‌گیرد ولی نشان نمی‌دهد» است.
+          // اینجا صریح لاگ می‌کنیم.
+          if (_debugMode) {
+            print("❌ Base32 decode failed: $e");
+            print("DEBUG: normalized.len=${normalized.length} tot=$tot sid=$sid");
+          }
+          return;
+        }
 
-        final decrypted = await PeykCrypto.decrypt(decodedBytes);
+        String decrypted;
+        try {
+          decrypted = await PeykCrypto.decrypt(decoded);
+        } catch (e) {
+          if (_debugMode) {
+            print("❌ Decrypt failed: $e");
+            print("DEBUG: decoded.len=${decoded.length} tot=$tot sid=$sid");
+          }
+          return;
+        }
 
+        // نمایش پیام
+        if (!mounted) return;
         setState(() {
           _messages.insert(0, {
             "text": decrypted,
@@ -286,9 +334,7 @@ class _ChatScreenState extends State<ChatScreen>
           });
         });
 
-        if (_debugMode) print("✅ Success: Message decrypted and shown.");
-
-        // ✅ Send ACK2 back to server to confirm delivery (✓✓ for sender)
+        // ACK2 برای server-stable: فقط ack2-sid-tot
         final transport = DnsTransport(_serverIP);
         await transport.sendOnly(
           DnsCodec.buildQuery(
@@ -298,7 +344,7 @@ class _ChatScreenState extends State<ChatScreen>
         );
       }
     } catch (e) {
-      if (_debugMode) print("❌ Chunk Parsing Error: $e");
+      if (_debugMode) print("❌ RX Error: $e");
     }
   }
 
@@ -312,10 +358,17 @@ class _ChatScreenState extends State<ChatScreen>
       appBar: AppBar(
         title: const Text(
           "PEYK-D TERMINAL",
-          style: TextStyle(letterSpacing: 3, fontSize: 12, fontWeight: FontWeight.bold),
+          style: TextStyle(
+            letterSpacing: 3,
+            fontSize: 12,
+            fontWeight: FontWeight.bold,
+          ),
         ),
         actions: [
-          IconButton(icon: const Icon(Icons.settings, size: 20), onPressed: _showSettings),
+          IconButton(
+            icon: const Icon(Icons.settings, size: 20),
+            onPressed: _showSettings,
+          ),
         ],
       ),
       body: Column(
@@ -340,7 +393,7 @@ class _ChatScreenState extends State<ChatScreen>
         return const SizedBox.shrink();
     }
   }
-  
+
   Widget _buildStatusLine() {
     return Container(
       width: double.infinity,
@@ -381,7 +434,8 @@ class _ChatScreenState extends State<ChatScreen>
           ),
         ),
         child: Column(
-          crossAxisAlignment: isRx ? CrossAxisAlignment.start : CrossAxisAlignment.end,
+          crossAxisAlignment:
+              isRx ? CrossAxisAlignment.start : CrossAxisAlignment.end,
           children: [
             if (isRx)
               Text(
@@ -402,8 +456,7 @@ class _ChatScreenState extends State<ChatScreen>
                   style: const TextStyle(color: Colors.white30, fontSize: 8),
                 ),
                 const SizedBox(width: 4),
-                if (msg["status"] != "received")
-                  _buildStatusIcon(msg["status"]),
+                if (msg["status"] != "received") _buildStatusIcon(msg["status"]),
               ],
             ),
           ],
@@ -423,7 +476,9 @@ class _ChatScreenState extends State<ChatScreen>
               controller: _controller,
               style: const TextStyle(fontSize: 14),
               decoration: InputDecoration(
-                hintText: _targetID.isEmpty ? "Set Target in Settings" : "Message to $_targetID...",
+                hintText: _targetID.isEmpty
+                    ? "Set Target in Settings"
+                    : "Message to $_targetID...",
                 hintStyle: const TextStyle(color: Colors.white24),
                 filled: true,
                 fillColor: const Color(0xFF2A3942),
@@ -448,7 +503,6 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   // ───────────────────────── SETTINGS ─────────────────────────
-// ───────────────────────── SETTINGS ─────────────────────────
   void _showSettings() async {
     final prefs = await SharedPreferences.getInstance();
     final domainCtrl = TextEditingController(text: _baseDomain);
@@ -468,7 +522,10 @@ class _ChatScreenState extends State<ChatScreen>
           backgroundColor: const Color(0xFF182229),
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(20),
-            side: BorderSide(color: const Color(0xFF00A884).withOpacity(0.3), width: 1),
+            side: BorderSide(
+              color: const Color(0xFF00A884).withOpacity(0.3),
+              width: 1,
+            ),
           ),
           title: const Text(
             "NODE CONFIGURATION",
@@ -504,8 +561,10 @@ class _ChatScreenState extends State<ChatScreen>
                     ),
                     child: Column(
                       children: [
-                        const Text("YOUR UNIQUE ADDRESS",
-                            style: TextStyle(fontSize: 8, color: Colors.white38)),
+                        const Text(
+                          "YOUR UNIQUE ADDRESS",
+                          style: TextStyle(fontSize: 8, color: Colors.white38),
+                        ),
                         const SizedBox(height: 8),
                         SelectableText(
                           _myID,
@@ -538,11 +597,9 @@ class _ChatScreenState extends State<ChatScreen>
                   ],
                 ),
                 const Divider(color: Colors.white10, height: 25),
-
                 _buildSettingField(targetCtrl, "Target Node ID", Icons.person_pin, "abcde"),
                 _buildSettingField(ipCtrl, "Relay Server IP", Icons.lan, "1.2.3.4"),
-                _buildSettingField(domainCtrl, "Base Domain", Icons.dns, "p99.peyk-d.ir"), // اضافه شد
-                
+                _buildSettingField(domainCtrl, "Base Domain", Icons.dns, "p99.peyk-d.ir"),
                 const SizedBox(height: 10),
                 Row(
                   children: [
@@ -551,9 +608,7 @@ class _ChatScreenState extends State<ChatScreen>
                     Expanded(child: _buildSettingField(pollMaxCtrl, "Max Poll", Icons.timer, "40", isNum: true)),
                   ],
                 ),
-                
                 _buildSettingField(retryCtrl, "Retries", Icons.repeat, "1", isNum: true),
-                
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text("Active Polling", style: TextStyle(fontSize: 12, color: Colors.white70)),
@@ -584,12 +639,13 @@ class _ChatScreenState extends State<ChatScreen>
               onPressed: () async {
                 await prefs.setString('target_id', targetCtrl.text.trim());
                 await prefs.setString('server_ip', ipCtrl.text.trim());
-                await prefs.setString('base_domain', domainCtrl.text.trim()); // اضافه شد
+                await prefs.setString('base_domain', domainCtrl.text.trim());
                 await prefs.setInt('poll_min', int.tryParse(pollMinCtrl.text) ?? 20);
                 await prefs.setInt('poll_max', int.tryParse(pollMaxCtrl.text) ?? 40);
                 await prefs.setInt('retry_count', int.tryParse(retryCtrl.text) ?? 1);
                 await prefs.setBool('polling_enabled', _pollingEnabled);
                 await prefs.setBool('debug_mode', _debugMode);
+
                 _loadSettings();
                 if (context.mounted) Navigator.pop(context);
               },
