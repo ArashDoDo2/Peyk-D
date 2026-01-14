@@ -8,28 +8,28 @@ class DnsTransport {
 
   DnsTransport(this.serverIP, {this.port = 53});
 
-  /// ارسال پکت بدون انتظار برای پاسخ (Fire-and-Forget)
-  /// مناسب برای ارسال chunk و ACK2
   Future<void> sendOnly(Uint8List query) async {
     RawDatagramSocket? socket;
     try {
       socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
       socket.send(query, InternetAddress(serverIP), port);
-      await Future.delayed(const Duration(milliseconds: 10));
+      // یک وقفه بسیار کوتاه برای اطمینان از خروج پکت از بافر سیستم‌عامل
+      await Future.delayed(const Duration(milliseconds: 20));
     } catch (e) {
-      print("❌ UDP Send Error: $e");
+      // در حالت Debug چاپ شود
     } finally {
       socket?.close();
     }
   }
 
-  /// ارسال پکت و انتظار برای پاسخ سرور (Polling / TXT / ACK2)
-  Future<Uint8List?> sendAndWait(
-    Uint8List query, {
-    int timeoutMs = 2000,
-  }) async {
+  Future<Uint8List?> sendAndReceive(Uint8List query, {int timeoutMs = 2500}) async {
+    if (query.length < 2) return null;
+    
+    // استخراج TXID برای تایید اصالت پاسخ
+    final txid = (query[0] << 8) | query[1];
     final completer = Completer<Uint8List?>();
     RawDatagramSocket? socket;
+    Timer? timeoutTimer;
 
     try {
       socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
@@ -39,57 +39,47 @@ class DnsTransport {
         (RawSocketEvent event) {
           if (event == RawSocketEvent.read) {
             final datagram = socket?.receive();
-            if (datagram != null && !completer.isCompleted) {
-              completer.complete(datagram.data);
-              socket?.close(); // بستن بعد از اولین پاسخ
+            if (datagram != null && datagram.data.length >= 2) {
+              final responseId = (datagram.data[0] << 8) | datagram.data[1];
+              
+              // تایید اینکه این پاسخ مربوط به همین درخواست است
+              if (responseId == txid && !completer.isCompleted) {
+                timeoutTimer?.cancel();
+                completer.complete(datagram.data);
+                socket?.close();
+              }
             }
           }
         },
-        onError: (_) {
-          if (!completer.isCompleted) completer.complete(null);
-        },
-        onDone: () {
-          if (!completer.isCompleted) completer.complete(null);
-        },
+        onError: (e) => _safeComplete(completer, null),
+        onDone: () => _safeComplete(completer, null),
       );
 
-      return await completer.future.timeout(
-        Duration(milliseconds: timeoutMs),
-        onTimeout: () => null,
-      );
+      // مدیریت تایم‌اوت به صورت دستی برای کنترل دقیق‌تر
+      timeoutTimer = Timer(Duration(milliseconds: timeoutMs), () {
+        _safeComplete(completer, null);
+        socket?.close();
+      });
+
+      return await completer.future;
     } catch (e) {
-      print("❌ Transport Error: $e");
-      return null;
-    } finally {
       socket?.close();
+      return null;
     }
   }
 
-  /// Alias برای سازگاری با chat_screen.dart
-  /// (کدت از این متد استفاده می‌کند)
-  Future<Uint8List?> sendAndReceive(
-    Uint8List query, {
-    int timeoutMs = 2000,
-  }) {
-    return sendAndWait(query, timeoutMs: timeoutMs);
+  void _safeComplete(Completer c, dynamic value) {
+    if (!c.isCompleted) c.complete(value);
   }
 
-  /// تست ساده اتصال به سرور DNS
+  // متد کمکی برای تست سلامت مسیر UDP
   Future<bool> pingServer() async {
-    final pingQuery = Uint8List.fromList([
-      0xAA, 0xBB, // TX ID
-      0x01, 0x00, // Flags
-      0x00, 0x01, // QDCount
-      0x00, 0x00, // AN
-      0x00, 0x00, // NS
-      0x00, 0x00, // AR
-      0x04, 0x70, 0x69, 0x6e, 0x67, // "ping"
-      0x00,
-      0x00, 0x01, // QTYPE A
-      0x00, 0x01, // QCLASS IN
+    // ایجاد یک کوئری ساده A برای دامین اصلی
+    final ping = Uint8List.fromList([
+      0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 
+      0x00, 0x00, 0x00, 0x00, 0x01, 0x76, 0x00, 0x00, 0x01, 0x00, 0x01
     ]);
-
-    final response = await sendAndWait(pingQuery, timeoutMs: 1500);
-    return response != null;
+    final res = await sendAndReceive(ping, timeoutMs: 1500);
+    return res != null;
   }
 }
