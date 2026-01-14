@@ -25,6 +25,11 @@ const (
 
 	MY_ID     = "simul"
 	TARGET_ID = "a3akc"
+
+	// Direct server IP for DNS queries (bypasses recursive DNS)
+	// Set to empty string "" to use system recursive DNS instead
+	DIRECT_SERVER_IP   = "127.0.0.1"
+	DIRECT_SERVER_PORT = 53
 )
 
 // RX buffers: key = "sid-rid-tot" -> idx->payload
@@ -57,9 +62,13 @@ var resolver4 = &net.Resolver{
 }
 
 func main() {
-	fmt.Println("🚀 Peyk Simulator Pro [RECURSIVE MODE - IPv4 ONLY] Started...")
+	fmt.Println("🚀 Peyk Simulator Pro [AAAA/A Mode] Started...")
 	fmt.Printf("🆔 My ID: %s | 🎯 Target ID: %s\n", MY_ID, TARGET_ID)
-	fmt.Println("🌐 Using system recursive DNS, forced IPv4 to avoid AAAA delays.")
+	if DIRECT_SERVER_IP != "" {
+		fmt.Printf("🌐 DIRECT mode: sending to %s:%d\n", DIRECT_SERVER_IP, DIRECT_SERVER_PORT)
+	} else {
+		fmt.Println("🌐 RECURSIVE mode: using system DNS resolver")
+	}
 	fmt.Println("--------------------------------------------------")
 
 	go startPolling()
@@ -87,22 +96,18 @@ func startPolling() {
 	backoff := minBackoff
 
 	for {
-		queryStr := fmt.Sprintf("v1.sync.%s.%s", MY_ID, BASE_DOMAIN)
+		queryDomain := fmt.Sprintf("v1.sync.%s.%s", MY_ID, BASE_DOMAIN)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
-		txts, err := resolver4.LookupTXT(ctx, queryStr)
-		cancel()
+		var txt string
 
-		if err != nil || len(txts) == 0 {
-			time.Sleep(backoff)
-			backoff = time.Duration(float64(backoff) * backoffStep)
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
-			continue
+		if DIRECT_SERVER_IP != "" {
+			// Direct mode: send raw DNS query to Peyk server
+			txt = pollDirect(queryDomain)
+		} else {
+			// Recursive mode (fallback)
+			txt = pollRecursive(queryDomain)
 		}
 
-		txt := txts[0]
 		if txt == "" || txt == "NOP" {
 			time.Sleep(backoff)
 			backoff = time.Duration(float64(backoff) * backoffStep)
@@ -116,13 +121,221 @@ func startPolling() {
 
 		if strings.HasPrefix(txt, "ACK2-") {
 			fmt.Println("✅ [ACK2 RECEIVED]", txt)
-			handleAck2Metric(txt) // ✅ Peyk latency metric
+			handleAck2Metric(txt)
 		} else {
 			handleIncomingChunk(txt)
 		}
 
 		time.Sleep(fastDelay)
 	}
+}
+
+// pollDirect sends raw DNS query directly to Peyk server
+func pollDirect(domain string) string {
+	addr := fmt.Sprintf("%s:%d", DIRECT_SERVER_IP, DIRECT_SERVER_PORT)
+	conn, err := net.DialTimeout("udp", addr, 1500*time.Millisecond)
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+
+	// Try AAAA first
+	query := buildDNSQuery(domain, 28) // AAAA
+	conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
+	_, err = conn.Write(query)
+	if err != nil {
+		return ""
+	}
+
+	buf := make([]byte, 512)
+	n, err := conn.Read(buf)
+	if err == nil && n > 12 {
+		txt := extractPayloadFromDNSResponse(buf[:n])
+		if txt != "" && txt != "NOP" {
+			return txt
+		}
+	}
+
+	// Fallback to A
+	query = buildDNSQuery(domain, 1) // A
+	conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
+	_, err = conn.Write(query)
+	if err != nil {
+		return ""
+	}
+
+	n, err = conn.Read(buf)
+	if err == nil && n > 12 {
+		return extractPayloadFromDNSResponse(buf[:n])
+	}
+
+	return ""
+}
+
+// pollRecursive uses system DNS resolver (legacy)
+func pollRecursive(domain string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	ips, err := resolver4.LookupIP(ctx, "ip6", domain)
+	cancel()
+
+	if err == nil && len(ips) > 0 {
+		txt := extractPayloadFromIPs(ips)
+		if txt != "" {
+			return txt
+		}
+	}
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	ips4, err4 := resolver4.LookupIP(ctx2, "ip4", domain)
+	cancel2()
+
+	if err4 == nil && len(ips4) > 0 {
+		return extractPayloadFromIPs(ips4)
+	}
+
+	return ""
+}
+
+// buildDNSQuery creates a raw DNS query packet
+func buildDNSQuery(domain string, qtype uint16) []byte {
+	buf := make([]byte, 0, 512)
+
+	// Transaction ID (random)
+	txid := uint16(time.Now().UnixNano() & 0xFFFF)
+	buf = append(buf, byte(txid>>8), byte(txid&0xFF))
+
+	// Flags: Standard query, recursion desired
+	buf = append(buf, 0x01, 0x00)
+
+	// QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+	buf = append(buf, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+
+	// QNAME
+	for _, label := range strings.Split(domain, ".") {
+		if label == "" {
+			continue
+		}
+		buf = append(buf, byte(len(label)))
+		buf = append(buf, []byte(label)...)
+	}
+	buf = append(buf, 0x00) // null terminator
+
+	// QTYPE
+	buf = append(buf, byte(qtype>>8), byte(qtype&0xFF))
+
+	// QCLASS: IN
+	buf = append(buf, 0x00, 0x01)
+
+	return buf
+}
+
+// extractPayloadFromDNSResponse extracts payload bytes from DNS response
+func extractPayloadFromDNSResponse(data []byte) string {
+	if len(data) < 12 {
+		return ""
+	}
+
+	// ANCOUNT
+	ancount := int(data[6])<<8 | int(data[7])
+	if ancount == 0 {
+		return ""
+	}
+
+	// Skip header (12 bytes)
+	i := 12
+
+	// Skip question section
+	for i < len(data) && data[i] != 0 {
+		if data[i]&0xC0 == 0xC0 {
+			i += 2
+			break
+		}
+		i += int(data[i]) + 1
+	}
+	if i < len(data) && data[i] == 0 {
+		i++
+	}
+	i += 4 // QTYPE + QCLASS
+
+	var payload []byte
+
+	// Parse answers
+	for a := 0; a < ancount && i+10 <= len(data); a++ {
+		// Skip NAME
+		if data[i]&0xC0 == 0xC0 {
+			i += 2
+		} else {
+			for i < len(data) && data[i] != 0 {
+				i += int(data[i]) + 1
+			}
+			if i < len(data) {
+				i++
+			}
+		}
+
+		if i+10 > len(data) {
+			break
+		}
+
+		rtype := int(data[i])<<8 | int(data[i+1])
+		i += 8 // TYPE + CLASS + TTL
+
+		rdlen := int(data[i])<<8 | int(data[i+1])
+		i += 2
+
+		if i+rdlen > len(data) {
+			break
+		}
+
+		// A (4 bytes) or AAAA (16 bytes)
+		if rtype == 1 || rtype == 28 {
+			payload = append(payload, data[i:i+rdlen]...)
+		}
+
+		i += rdlen
+	}
+
+	// Trim trailing null bytes
+	for len(payload) > 0 && payload[len(payload)-1] == 0 {
+		payload = payload[:len(payload)-1]
+	}
+
+	return string(payload)
+}
+
+// extractPayloadFromIPs extracts bytes from IP addresses (for recursive mode)
+func extractPayloadFromIPs(ips []net.IP) string {
+	var buf []byte
+	for _, ip := range ips {
+		if ip4 := ip.To4(); ip4 != nil {
+			buf = append(buf, ip4...)
+		} else if ip16 := ip.To16(); ip16 != nil {
+			buf = append(buf, ip16...)
+		}
+	}
+	// Trim trailing null bytes
+	for len(buf) > 0 && buf[len(buf)-1] == 0 {
+		buf = buf[:len(buf)-1]
+	}
+	return string(buf)
+}
+
+// sendDirectDNSQuery sends a DNS query directly to the Peyk server (fire and forget)
+func sendDirectDNSQuery(domain string, qtype uint16) {
+	addr := fmt.Sprintf("%s:%d", DIRECT_SERVER_IP, DIRECT_SERVER_PORT)
+	conn, err := net.DialTimeout("udp", addr, 1500*time.Millisecond)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	query := buildDNSQuery(domain, qtype)
+	conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
+	conn.Write(query)
+
+	// Wait for response (to get ACK from server)
+	buf := make([]byte, 512)
+	conn.Read(buf)
 }
 
 // ✅ Parse ACK2 and compute Peyk latency if it's for our outgoing message
@@ -287,15 +500,19 @@ func isDuplicateAndMark(k string) bool {
 // ───────────────────────── ACK2 (Stable) ─────────────────────────
 //
 // Send "ack2-<sid>-<tot>.<base>" (no RID) — matches stable server.
-// Retry a few times (best-effort) because recursive DNS can drop.
+// Retry a few times (best-effort) because DNS can drop.
 
 func retryAck2Stable(senderID string, total int) {
 	domain := fmt.Sprintf("ack2-%s-%d.%s", strings.ToLower(senderID), total, BASE_DOMAIN)
 
 	for i := 0; i < 3; i++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
-		_, _ = resolver4.LookupIP(ctx, "ip4", domain)
-		cancel()
+		if DIRECT_SERVER_IP != "" {
+			sendDirectDNSQuery(domain, 1) // A query
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+			_, _ = resolver4.LookupIP(ctx, "ip4", domain)
+			cancel()
+		}
 		time.Sleep(350 * time.Millisecond)
 	}
 
@@ -321,11 +538,11 @@ func sendManualMessage(msg string) {
 		base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(fullData),
 	)
 
-	sendChunksRecursive(encoded)
+	sendChunks(encoded)
 }
 
-func sendChunksRecursive(data string) {
-	chunkSize := 45
+func sendChunks(data string) {
+	chunkSize := 30 // Match Flutter client chunk size
 	total := (len(data) + chunkSize - 1) / chunkSize
 
 	// ✅ record Peyk TX start time for latency metric
@@ -351,16 +568,24 @@ func sendChunksRecursive(data string) {
 		host := label + "." + BASE_DOMAIN
 
 		startTime := time.Now()
-		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
-		_, err := resolver4.LookupIP(ctx, "ip4", host)
-		cancel()
+		var err error
+
+		if DIRECT_SERVER_IP != "" {
+			// Direct mode
+			sendDirectDNSQuery(host, 1) // A query
+		} else {
+			// Recursive mode
+			ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+			_, err = resolver4.LookupIP(ctx, "ip4", host)
+			cancel()
+		}
 		rtt := time.Since(startTime)
 
 		if err != nil {
-			fmt.Printf("⚠️ [TX] Chunk %d/%d - SENT (ip4 err after %v)\n", i+1, total, rtt.Round(time.Millisecond))
+			fmt.Printf("⚠️ [TX] Chunk %d/%d - SENT (err after %v)\n", i+1, total, rtt.Round(time.Millisecond))
 			time.Sleep(slowPace)
 		} else {
-			fmt.Printf("📤 [TX] Chunk %d/%d - SENT (ip4 RTT: %v)\n", i+1, total, rtt.Round(time.Millisecond))
+			fmt.Printf("📤 [TX] Chunk %d/%d - SENT (RTT: %v)\n", i+1, total, rtt.Round(time.Millisecond))
 			time.Sleep(fastPace)
 		}
 	}
