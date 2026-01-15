@@ -31,6 +31,7 @@ const (
 	ENABLE_RX_CHUNK_LOG = false
 	ENABLE_ACK2_LOG     = false
 	ENABLE_GC_LOG       = true
+	ACK2_TTL           = 24 * time.Hour
 )
 
 // DNS Types
@@ -62,6 +63,7 @@ var (
 	// deliveryAcks: map[senderID][]string
 	// payload: "ACK2-<sid>-<tot>"
 	deliveryAcks = make(map[string][]string)
+	ack2Seen     = make(map[string]time.Time)
 
 	storeMu sync.Mutex
 )
@@ -185,7 +187,7 @@ func handlePacket(conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
 	txID := data[:2]
 	txIDHex := fmt.Sprintf("%02x%02x", txID[0], txID[1])
 
-    logIf(ENABLE_VERBOSE_LOG, "RX pkt from=%s txid=%s qtype=%d qname=%s", addr.String(), txIDHex, q.QType, domain)
+	logIf(ENABLE_VERBOSE_LOG, "RX pkt from=%s txid=%s qtype=%d qname=%s", addr.String(), txIDHex, q.QType, domain)
 
 	// Polling (NOW: AAAA preferred, fallback to A)
 	if strings.HasPrefix(domain, "v1.sync.") {
@@ -201,12 +203,18 @@ func handlePacket(conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
 	}
 
 	// Inbound chunk or ACK2 (A)
-	if q.QType != QTYPE_A {
+	prefix := strings.TrimSuffix(domain, "."+BASE_DOMAIN)
+	label := prefix
+	if dot := strings.IndexByte(prefix, '.'); dot >= 0 {
+		label = prefix[:dot]
+	}
+	ack2Label := strings.HasPrefix(label, "ack2-")
+	if q.QType != QTYPE_A && !(ack2Label && q.QType == QTYPE_AAAA) {
 		atomic.AddUint64(&statIgnored, 1)
 		return
 	}
 	handleInboundOrAck2(conn, addr, txID, domain, q.QType, q.QClass)
-    logIf(ENABLE_VERBOSE_LOG, "done A from=%s txid=%s took=%s", addr.String(), txIDHex, time.Since(start))
+	logIf(ENABLE_VERBOSE_LOG, "done A from=%s txid=%s took=%s", addr.String(), txIDHex, time.Since(start))
 }
 
 // ───────────────────────── Inbound + ACK2 ─────────────────────────
@@ -240,7 +248,12 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 		}
 
 		storeMu.Lock()
-		deliveryAcks[sid] = append(deliveryAcks[sid], ack)
+		ackKey := fmt.Sprintf("%s:%d:%s", sid, tot, mid)
+		lastSeen, seen := ack2Seen[ackKey]
+		if !seen || time.Since(lastSeen) > ACK2_TTL {
+			deliveryAcks[sid] = append(deliveryAcks[sid], ack)
+			ack2Seen[ackKey] = time.Now()
+		}
 		queueLen := len(deliveryAcks[sid])
 		storeMu.Unlock()
 
@@ -438,6 +451,7 @@ func garbageCollector() {
 			expired      int
 			keysRemoved  int
 			ridsRemoved  int
+			ack2Removed  int
 		)
 
 		storeMu.Lock()
@@ -467,9 +481,18 @@ func garbageCollector() {
 		}
 		storeMu.Unlock()
 
-		if expired > 0 || keysRemoved > 0 || ridsRemoved > 0 {
-            logIf(ENABLE_GC_LOG, "GC expired=%d chunks (before=%d after=%d) keysRemoved=%d ridsRemoved=%d ttl=%s",
-				expired, beforeChunks, afterChunks, keysRemoved, ridsRemoved, MESSAGE_TTL)
+		storeMu.Lock()
+		for key, ts := range ack2Seen {
+			if now.Sub(ts) > ACK2_TTL {
+				delete(ack2Seen, key)
+				ack2Removed++
+			}
+		}
+		storeMu.Unlock()
+
+		if expired > 0 || keysRemoved > 0 || ridsRemoved > 0 || ack2Removed > 0 {
+			logIf(ENABLE_GC_LOG, "GC expired=%d chunks (before=%d after=%d) keysRemoved=%d ridsRemoved=%d ack2Removed=%d ttl=%s",
+				expired, beforeChunks, afterChunks, keysRemoved, ridsRemoved, ack2Removed, MESSAGE_TTL)
 		}
 	}
 }
