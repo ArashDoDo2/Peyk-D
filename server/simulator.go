@@ -611,9 +611,9 @@ func isDuplicateAndMark(k string) bool {
 func retryAck2Stable(senderID string, total int, mid string) {
 	domain := ""
 	if mid != "" {
-		domain = fmt.Sprintf("ack2-%s-%d-%s.%s", strings.ToLower(senderID), total, mid, BASE_DOMAIN)
+		domain = fmt.Sprintf("ack2-%s-%d-%s.%s.%s", strings.ToLower(senderID), total, mid, generateID(), BASE_DOMAIN)
 	} else {
-		domain = fmt.Sprintf("ack2-%s-%d.%s", strings.ToLower(senderID), total, BASE_DOMAIN)
+		domain = fmt.Sprintf("ack2-%s-%d.%s.%s", strings.ToLower(senderID), total, generateID(), BASE_DOMAIN)
 	}
 
 	for i := 0; i < 3; i++ {

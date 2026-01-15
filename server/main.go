@@ -202,10 +202,14 @@ func handlePacket(conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
 
 func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain string, qtype, qclass uint16) {
 	prefix := strings.TrimSuffix(domain, "."+BASE_DOMAIN)
+	label := prefix
+	if dot := strings.IndexByte(prefix, '.'); dot >= 0 {
+		label = prefix[:dot]
+	}
 
 	// ACK2: ack2-sid-tot or ack2-sid-tot-mid
-	if strings.HasPrefix(prefix, "ack2-") {
-		parts := strings.Split(prefix, "-")
+	if strings.HasPrefix(label, "ack2-") {
+		parts := strings.Split(label, "-")
 		if len(parts) < 3 || len(parts) > 4 {
 			return
 		}
@@ -241,7 +245,7 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 		return
 	}
 	// Chunk: idx-tot-sid-rid-payload (legacy) or idx-tot-mid-sid-rid-payload
-	labels := strings.Split(prefix, "-")
+	labels := strings.Split(label, "-")
 	if len(labels) < 5 {
 		return
 	}

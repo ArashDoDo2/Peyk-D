@@ -109,7 +109,8 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       final mid = IdUtils.generateRandomID();
 
       final ackKey = "${_myID.toLowerCase()}:${chunks.length}:$mid";
-      _pendingDelivery[ackKey] = 0;
+      _messages[0]["deliveryKey"] = ackKey;
+      _pendingDelivery[ackKey] = 1;
 
       for (int i = 0; i < chunks.length; i++) {
         final label = "${i + 1}-${chunks.length}-$mid-$_myID-$_targetID-${chunks[i]}";
@@ -239,15 +240,20 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   }
 
   void _handleDeliveryAck(String txt) {
-    final parts = txt.split("-");
+    final label = txt.split(".").first;
+    final parts = label.split("-");
     if (parts.length != 3 && parts.length != 4) return;
     final sid = parts[1].toLowerCase();
     final tot = parts[2];
     final mid = parts.length == 4 ? parts[3].toLowerCase() : "";
     final key = mid.isEmpty ? "$sid:$tot" : "$sid:$tot:$mid";
-    final msgIndex = _pendingDelivery[key];
-    if (msgIndex != null && msgIndex < _messages.length) {
-      setState(() => _messages[msgIndex]["status"] = "delivered");
+    if (_pendingDelivery.containsKey(key)) {
+      for (int i = 0; i < _messages.length; i++) {
+        if (_messages[i]["deliveryKey"] == key) {
+          setState(() => _messages[i]["status"] = "delivered");
+          break;
+        }
+      }
       _pendingDelivery.remove(key);
     }
   }
@@ -382,7 +388,8 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
           // ACK2 (A)
           final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
           final ackLabel = mid.isEmpty ? "ack2-$sid-$tot" : "ack2-$sid-$tot-$mid";
-          await transport.sendOnly("$ackLabel.$_baseDomain", qtype: 1);
+          final ackNonce = IdUtils.generateRandomID();
+          await transport.sendOnly("$ackLabel.$ackNonce.$_baseDomain", qtype: 1);
         } catch (e) {
           if (_debugMode) print("❌ Decryption/Base32 Error: $e");
         }
