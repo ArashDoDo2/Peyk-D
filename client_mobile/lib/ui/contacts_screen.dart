@@ -283,22 +283,72 @@ class _ContactsScreenState extends State<ContactsScreen> {
 
     final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
     bool hasMore = true;
+    const int burstAttempts = 3;
+    const int burstMinMs = 200;
+    const int burstMaxMs = 400;
 
     while (hasMore) {
-      final pollNonce = IdUtils.generateRandomID();
-      var response = await transport.sendAndReceive("v1.sync.$_myId.$pollNonce.$_baseDomain", qtype: 28);
-      if (response == null && _fallbackEnabled) {
-        response = await transport.sendAndReceive("v1.sync.$_myId.$pollNonce.$_baseDomain", qtype: 1);
-      }
-      if (response == null) break;
+      Uint8List? rawBytes;
+      String txt = "";
+      var usedAAAA = true;
+      bool looksFrame = false;
 
-      final txt = _bytesToText(response);
+      for (int attempt = 0; attempt < burstAttempts; attempt++) {
+        final pollNonce = IdUtils.generateRandomID();
+        var response = await transport.sendAndReceive("v1.sync.$_myId.$pollNonce.$_baseDomain", qtype: 28);
+        usedAAAA = true;
+        if (response == null && _fallbackEnabled) {
+          response = await transport.sendAndReceive("v1.sync.$_myId.$pollNonce.$_baseDomain", qtype: 1);
+          usedAAAA = false;
+        }
+        if (response == null) {
+          if (attempt < burstAttempts - 1) {
+            await Future.delayed(Duration(milliseconds: burstMinMs + Random().nextInt(burstMaxMs - burstMinMs + 1)));
+            continue;
+          }
+          break;
+        }
+
+        rawBytes = response;
+        txt = _bytesToText(rawBytes);
+        if ((txt.isEmpty || txt == "NOP") && usedAAAA && _fallbackEnabled) {
+          response = await transport.sendAndReceive("v1.sync.$_myId.$pollNonce.$_baseDomain", qtype: 1);
+          usedAAAA = false;
+          if (response != null) {
+            rawBytes = response;
+            txt = _bytesToText(rawBytes);
+          }
+        }
+        if (txt.isEmpty || txt == "NOP") {
+          if (attempt < burstAttempts - 1) {
+            await Future.delayed(Duration(milliseconds: burstMinMs + Random().nextInt(burstMaxMs - burstMinMs + 1)));
+            continue;
+          }
+        }
+
+        looksFrame = txt.startsWith("ACK2-") || '-'.allMatches(txt).length >= 4;
+        if (!looksFrame && usedAAAA && _fallbackEnabled) {
+          response = await transport.sendAndReceive("v1.sync.$_myId.$pollNonce.$_baseDomain", qtype: 1);
+          usedAAAA = false;
+          if (response != null) {
+            rawBytes = response;
+            txt = _bytesToText(rawBytes);
+            looksFrame = txt.startsWith("ACK2-") || '-'.allMatches(txt).length >= 4;
+          }
+        }
+        if (!looksFrame && attempt < burstAttempts - 1) {
+          await Future.delayed(Duration(milliseconds: burstMinMs + Random().nextInt(burstMaxMs - burstMinMs + 1)));
+          continue;
+        }
+        break;
+      }
+
+      if (rawBytes == null) break;
       if (txt.isEmpty || txt == "NOP") {
         hasMore = false;
         break;
       }
-
-      if (!txt.startsWith("ACK2-") && '-'.allMatches(txt).length < 4) {
+      if (!looksFrame) {
         continue;
       }
 

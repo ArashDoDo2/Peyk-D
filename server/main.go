@@ -68,6 +68,7 @@ var (
 	ack2Seen     = make(map[string]time.Time)
 	msgFirstAt   = make(map[string]time.Time)
 	sendFirstAt  = make(map[string]time.Time)
+	sendCursor   = make(map[string]int)
 
 	storeMu sync.Mutex
 )
@@ -264,6 +265,37 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 			ack2Seen[ackKey] = time.Now()
 		}
 		queueLen := len(deliveryAcks[sid])
+
+		// Drop stored chunks for this message (stop resends after ACK2).
+		msgKey := ""
+		if mid != "" {
+			msgKey = fmt.Sprintf("%s:%s:%d", sid, mid, tot)
+		} else {
+			msgKey = fmt.Sprintf("%s:%d", sid, tot)
+		}
+		ridMatches := make([]string, 0, 2)
+		for rid, msgs := range messageStore {
+			if _, ok := msgs[msgKey]; ok {
+				ridMatches = append(ridMatches, rid)
+			}
+		}
+		if mid != "" || len(ridMatches) == 1 {
+			for _, rid := range ridMatches {
+				msgs := messageStore[rid]
+				delete(msgs, msgKey)
+				delete(sendCursor, fmt.Sprintf("%s|%s", rid, msgKey))
+				delete(msgFirstAt, fmt.Sprintf("%s|%s", rid, msgKey))
+				if start, okStart := sendFirstAt[fmt.Sprintf("%s|%s", rid, msgKey)]; okStart {
+					delete(sendFirstAt, fmt.Sprintf("%s|%s", rid, msgKey))
+					logEvent("[MSG-TX]", "\x1b[33m", "ack received sid=%s -> rid=%s parts=%d took=%s", sid, rid, tot, time.Since(start))
+				}
+				if len(msgs) == 0 {
+					delete(messageStore, rid)
+				}
+			}
+		} else {
+			logIf(ENABLE_ACK2_LOG, "ACK2 cleanup skipped for sid=%s tot=%d (ambiguous rid, mid missing)", sid, tot)
+		}
 		storeMu.Unlock()
 
 		atomic.AddUint64(&statRxAck2, 1)
@@ -419,7 +451,39 @@ func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain str
 	}
 
 	for key, chunks := range msgs {
-		c := chunks[0]
+		keyFull := fmt.Sprintf("%s|%s", rid, key)
+		nextIdx := sendCursor[keyFull]
+		if nextIdx <= 0 {
+			nextIdx = 1
+		}
+
+		var c ChunkEnvelope
+		found := false
+		for _, chunk := range chunks {
+			if chunk.Idx == nextIdx {
+				c = chunk
+				found = true
+				break
+			}
+		}
+		if !found {
+			nextIdx = 1
+			for _, chunk := range chunks {
+				if chunk.Idx == nextIdx {
+					c = chunk
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			c = chunks[0]
+		}
+		sendCursor[keyFull] = c.Idx + 1
+		if sendCursor[keyFull] > c.Tot {
+			sendCursor[keyFull] = 1
+		}
+
 		full := ""
 		if c.MID != "" {
 			full = fmt.Sprintf("%d-%d-%s-%s-%s-%s", c.Idx, c.Tot, c.MID, c.SID, c.RID, c.Payload)
@@ -433,32 +497,14 @@ func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain str
 			full = full[:480]
 		}
 
-		// delete immediately (no resend)
-		if len(chunks) == 1 {
-			delete(msgs, key)
-			if len(msgs) == 0 {
-				delete(messageStore, rid)
-			}
-		} else {
-			msgs[key] = chunks[1:]
-		}
-		leftInKey := len(msgs[key])
-		keyFull := fmt.Sprintf("%s|%s", rid, key)
+		leftInKey := len(chunks)
 		if _, ok := sendFirstAt[keyFull]; !ok {
 			sendFirstAt[keyFull] = time.Now()
-		}
-		var firstAt time.Time
-		if leftInKey == 0 {
-			firstAt = sendFirstAt[keyFull]
-			delete(sendFirstAt, keyFull)
 		}
 		storeMu.Unlock()
 
 		logIf(ENABLE_POLL_LOG, "poll rid=%s from=%s -> CHUNK key=%s sent=%d/%d sid=%s payloadLen=%d leftInKey=%d viaQ=%d preview=%q",
 			rid, addr.String(), key, c.Idx, c.Tot, c.SID, len(c.Payload), leftInKey, qtype, preview(full))
-		if leftInKey == 0 && !firstAt.IsZero() {
-			logEvent("[MSG-TX]", "\x1b[33m", "served sid=%s -> rid=%s parts=%d took=%s", c.SID, rid, c.Tot, time.Since(firstAt))
-		}
 
 		sendPollingPayload(conn, addr, txID, domain, full, qtype, qclass)
 		return
@@ -513,6 +559,9 @@ func garbageCollector() {
 				if len(filtered) == 0 {
 					delete(msgs, key)
 					keysRemoved++
+					delete(sendCursor, fmt.Sprintf("%s|%s", rid, key))
+					delete(msgFirstAt, fmt.Sprintf("%s|%s", rid, key))
+					delete(sendFirstAt, fmt.Sprintf("%s|%s", rid, key))
 				} else {
 					msgs[key] = filtered
 					afterChunks += len(filtered)
@@ -531,6 +580,12 @@ func garbageCollector() {
 		for key, ts := range sendFirstAt {
 			if now.Sub(ts) > MESSAGE_TTL {
 				delete(sendFirstAt, key)
+			}
+		}
+		for key := range sendCursor {
+			if _, ok := sendFirstAt[key]; !ok {
+				// cursor without active key (message expired or cleaned)
+				delete(sendCursor, key)
 			}
 		}
 		storeMu.Unlock()

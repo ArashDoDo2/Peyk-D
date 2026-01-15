@@ -310,21 +310,75 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
 
     final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
     bool hasMore = true;
+    const int burstAttempts = 3;
+    const int burstMinMs = 200;
+    const int burstMaxMs = 400;
 
     while (hasMore) {
-      // 1) Try AAAA
-      final pollNonce = IdUtils.generateRandomID();
-      var response = await transport.sendAndReceive("v1.sync.$_myID.$pollNonce.$_baseDomain", qtype: 28);
+      Uint8List? rawBytes;
+      String txt = "";
+      var usedAAAA = true;
+      bool looksFrame = false;
 
-      // 2) Fallback to A only if no response
-      if (response == null && _fallbackEnabled) {
-        response = await transport.sendAndReceive("v1.sync.$_myID.$pollNonce.$_baseDomain", qtype: 1);
+      for (int attempt = 0; attempt < burstAttempts; attempt++) {
+        // 1) Try AAAA
+        final pollNonce = IdUtils.generateRandomID();
+        var response = await transport.sendAndReceive("v1.sync.$_myID.$pollNonce.$_baseDomain", qtype: 28);
+        usedAAAA = true;
+
+        // 2) Fallback to A only if no response
+        if (response == null && _fallbackEnabled) {
+          response = await transport.sendAndReceive("v1.sync.$_myID.$pollNonce.$_baseDomain", qtype: 1);
+          usedAAAA = false;
+        }
+
+        if (response == null) {
+          if (attempt < burstAttempts - 1) {
+            await Future.delayed(Duration(milliseconds: burstMinMs + Random().nextInt(burstMaxMs - burstMinMs + 1)));
+            continue;
+          }
+          break;
+        }
+
+        rawBytes = response;
+        txt = _bytesToText(rawBytes);
+
+        if ((txt.isEmpty || txt == "NOP") && usedAAAA && _fallbackEnabled) {
+          response = await transport.sendAndReceive("v1.sync.$_myID.$pollNonce.$_baseDomain", qtype: 1);
+          usedAAAA = false;
+          if (response != null) {
+            rawBytes = response;
+            txt = _bytesToText(rawBytes);
+          }
+        }
+
+        if (txt.isEmpty || txt == "NOP") {
+          if (attempt < burstAttempts - 1) {
+            await Future.delayed(Duration(milliseconds: burstMinMs + Random().nextInt(burstMaxMs - burstMinMs + 1)));
+            continue;
+          }
+        }
+
+        looksFrame = txt.startsWith("ACK2-") || '-'.allMatches(txt).length >= 4;
+        if (!looksFrame && usedAAAA && _fallbackEnabled) {
+          response = await transport.sendAndReceive("v1.sync.$_myID.$pollNonce.$_baseDomain", qtype: 1);
+          usedAAAA = false;
+          if (response != null) {
+            rawBytes = response;
+            txt = _bytesToText(rawBytes);
+            looksFrame = txt.startsWith("ACK2-") || '-'.allMatches(txt).length >= 4;
+          }
+        }
+
+        if (!looksFrame && attempt < burstAttempts - 1) {
+          await Future.delayed(Duration(milliseconds: burstMinMs + Random().nextInt(burstMaxMs - burstMinMs + 1)));
+          continue;
+        }
+
+        break;
       }
 
-      if (response == null) break;
-
-      final rawBytes = response;
-      final txt = _bytesToText(rawBytes);
+      if (rawBytes == null) break;
 
       if (txt.isEmpty || txt == "NOP") {
         hasMore = false;
@@ -333,7 +387,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
 
       // ✅ HARD GUARD: only ACK2 or full frame is allowed.
       // This prevents base32-only junk from ever reaching RX.
-      if (!txt.startsWith("ACK2-") && '-'.allMatches(txt).length < 4) {
+      if (!looksFrame) {
         if (_debugMode) print("DEBUG POLL => dropped non-frame payload: $txt");
         continue;
       }
