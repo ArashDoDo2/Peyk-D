@@ -74,6 +74,8 @@ class DnsCodec {
       i += 4; // QTYPE + QCLASS
 
       final out = BytesBuilder();
+      final Map<int, Uint8List> indexedParts = {};
+      bool hasIndex0 = false;
 
       int skipName(int offset) {
         if (offset >= data.length) return data.length;
@@ -103,7 +105,15 @@ class DnsCodec {
         if (i + rdLen > data.length) break;
 
         if (type == 1 || type == 28) {
-          out.add(data.sublist(i, i + rdLen));
+          final raw = Uint8List.fromList(data.sublist(i, i + rdLen));
+          out.add(raw);
+          if (rdLen >= 2 && raw[0] > 0) {
+            final idx = raw[0] - 1;
+            if (!indexedParts.containsKey(idx)) {
+              indexedParts[idx] = Uint8List.fromList(raw.sublist(1));
+              if (idx == 0) hasIndex0 = true;
+            }
+          }
         } else if (type == 16) {
           int j = i;
           while (j < i + rdLen) {
@@ -116,6 +126,15 @@ class DnsCodec {
         }
 
         i += rdLen;
+      }
+
+      if (indexedParts.isNotEmpty && hasIndex0) {
+        final ordered = indexedParts.keys.toList()..sort();
+        final rebuilt = BytesBuilder();
+        for (final idx in ordered) {
+          rebuilt.add(indexedParts[idx]!);
+        }
+        return rebuilt.toBytes();
       }
 
       return out.toBytes();

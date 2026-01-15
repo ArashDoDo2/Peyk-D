@@ -25,6 +25,7 @@ const (
 	GC_EVERY          = 20 * time.Second
 	MESSAGE_TTL       = 2 * time.Minute
 	PAYLOAD_PREVIEW   = 24 // chars
+	ENABLE_STATS_LOG  = false
 )
 
 // DNS Types
@@ -40,6 +41,7 @@ const (
 type ChunkEnvelope struct {
 	Idx     int
 	Tot     int
+	MID     string
 	SID     string
 	RID     string
 	Payload string
@@ -201,32 +203,44 @@ func handlePacket(conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
 func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain string, qtype, qclass uint16) {
 	prefix := strings.TrimSuffix(domain, "."+BASE_DOMAIN)
 
-	// ACK2: ack2-sid-tot
+	// ACK2: ack2-sid-tot or ack2-sid-tot-mid
 	if strings.HasPrefix(prefix, "ack2-") {
 		parts := strings.Split(prefix, "-")
-		if len(parts) != 3 {
+		if len(parts) < 3 || len(parts) > 4 {
 			return
 		}
 		sid := strings.ToLower(parts[1])
 		tot := atoiSafe(parts[2])
+		mid := ""
+		if len(parts) == 4 {
+			mid = strings.ToLower(parts[3])
+		}
 		if tot <= 0 {
 			return
 		}
 
+		ack := fmt.Sprintf("ACK2-%s-%d", sid, tot)
+		if mid != "" {
+			ack = fmt.Sprintf("ACK2-%s-%d-%s", sid, tot, mid)
+		}
+
 		storeMu.Lock()
-		deliveryAcks[sid] = append(deliveryAcks[sid], fmt.Sprintf("ACK2-%s-%d", sid, tot))
+		deliveryAcks[sid] = append(deliveryAcks[sid], ack)
 		queueLen := len(deliveryAcks[sid])
 		storeMu.Unlock()
 
 		atomic.AddUint64(&statRxAck2, 1)
-		log.Printf("✅ ACK2 stored sid=%s tot=%d (queue=%d) from=%s", sid, tot, queueLen, addr.String())
+		if mid != "" {
+			log.Printf("? ACK2 stored sid=%s tot=%d mid=%s (queue=%d) from=%s", sid, tot, mid, queueLen, addr.String())
+		} else {
+			log.Printf("? ACK2 stored sid=%s tot=%d (queue=%d) from=%s", sid, tot, queueLen, addr.String())
+		}
 
 		// Keep ACK response as A with fixed ACK_IP (unchanged)
 		sendAResponse(conn, addr, txID, domain, ACK_IP, qtype, qclass)
 		return
 	}
-
-	// Chunk: idx-tot-sid-rid-payload
+	// Chunk: idx-tot-sid-rid-payload (legacy) or idx-tot-mid-sid-rid-payload
 	labels := strings.Split(prefix, "-")
 	if len(labels) < 5 {
 		return
@@ -234,9 +248,21 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 
 	idx := atoiSafe(labels[0])
 	tot := atoiSafe(labels[1])
-	sid := strings.ToLower(labels[2])
-	rid := strings.ToLower(labels[3])
-	payload := strings.Join(labels[4:], "-")
+	mid := ""
+	sid := ""
+	rid := ""
+	payload := ""
+
+	if len(labels) >= 6 && isBase32ID(labels[2]) && isBase32ID(labels[3]) && isBase32ID(labels[4]) {
+		mid = strings.ToLower(labels[2])
+		sid = strings.ToLower(labels[3])
+		rid = strings.ToLower(labels[4])
+		payload = strings.Join(labels[5:], "-")
+	} else {
+		sid = strings.ToLower(labels[2])
+		rid = strings.ToLower(labels[3])
+		payload = strings.Join(labels[4:], "-")
+	}
 
 	if idx <= 0 || tot <= 0 || idx > tot || payload == "" {
 		return
@@ -245,13 +271,19 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 	env := ChunkEnvelope{
 		Idx:     idx,
 		Tot:     tot,
+		MID:     mid,
 		SID:     sid,
 		RID:     rid,
 		Payload: payload,
 		AddedAt: time.Now(),
 	}
 
-	key := fmt.Sprintf("%s:%d", sid, tot)
+	key := ""
+	if mid != "" {
+		key = fmt.Sprintf("%s:%s:%d", sid, mid, tot)
+	} else {
+		key = fmt.Sprintf("%s:%d", sid, tot)
+	}
 
 	var (
 		dup     bool
@@ -328,7 +360,12 @@ func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain str
 
 	for key, chunks := range msgs {
 		c := chunks[0]
-		full := fmt.Sprintf("%d-%d-%s-%s-%s", c.Idx, c.Tot, c.SID, c.RID, c.Payload)
+		full := ""
+		if c.MID != "" {
+			full = fmt.Sprintf("%d-%d-%s-%s-%s-%s", c.Idx, c.Tot, c.MID, c.SID, c.RID, c.Payload)
+		} else {
+			full = fmt.Sprintf("%d-%d-%s-%s-%s", c.Idx, c.Tot, c.SID, c.RID, c.Payload)
+		}
 
 		// NOTE: We no longer have TXT 255 limitation; keep a sane cap anyway to avoid huge DNS responses.
 		// 480 bytes cap keeps us safe under typical 512-byte UDP DNS while still useful.
@@ -425,6 +462,9 @@ func garbageCollector() {
 // ───────────────────────── Stats Logger ─────────────────────────
 
 func statsLogger() {
+	if !ENABLE_STATS_LOG {
+		return
+	}
 	ticker := time.NewTicker(DEBUG_STATS_EVERY)
 	defer ticker.Stop()
 
@@ -522,8 +562,7 @@ func sendAResponse(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain, ip
 }
 
 // sendAAAABytesResponse packs payload bytes into multiple AAAA answers.
-// Each AAAA carries 16 bytes. Last chunk is zero-padded; client should trim by parsing payload format.
-// (Since payload is ASCII and format-delimited, padding zeros at the end is safe if client trims trailing \x00.)
+// Each AAAA carries 1-byte index + 15 bytes payload. Last chunk is zero-padded.
 func sendAAAABytesResponse(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain string, payload []byte, qclass uint16) {
 	ips := packBytesToIPv6(payload)
 	resp := buildBaseResponse(txID, domain, QTYPE_AAAA, qclass, uint16(len(ips)))
@@ -546,7 +585,7 @@ func sendAAAABytesResponse(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, do
 }
 
 // sendABytesResponse packs payload bytes into multiple A answers (fallback).
-// Each A carries 4 bytes. Last chunk is zero-padded similarly.
+// Each A carries 1-byte index + 3 bytes payload. Last chunk is zero-padded.
 func sendABytesResponse(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain string, payload []byte, qclass uint16) {
 	ips := packBytesToIPv4(payload)
 	resp := buildBaseResponse(txID, domain, QTYPE_A, qclass, uint16(len(ips)))
@@ -591,48 +630,70 @@ func sendTxtResponse(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain, 
 
 // ───────────────────────── Packing Helpers ─────────────────────────
 
-// packBytesToIPv6 splits data into 16-byte chunks. last chunk is zero-padded.
+// packBytesToIPv6 splits data into 15-byte chunks with a 1-byte index prefix.
 func packBytesToIPv6(b []byte) [][16]byte {
 	if len(b) == 0 {
-		// represent empty as single all-zero AAAA (client can treat as "NOP" only if it wants; we won't send empty anyway)
+		// represent empty as single all-zero AAAA
 		return [][16]byte{{}}
 	}
-	chunks := (len(b) + 15) / 16
+	chunks := (len(b) + 14) / 15
+	if chunks > 255 {
+		chunks = 255
+	}
 	out := make([][16]byte, 0, chunks)
 	for i := 0; i < chunks; i++ {
 		var ip [16]byte
-		start := i * 16
-		end := start + 16
+		ip[0] = byte(i + 1)
+		start := i * 15
+		end := start + 15
 		if end > len(b) {
 			end = len(b)
 		}
-		copy(ip[:], b[start:end])
+		copy(ip[1:], b[start:end])
 		out = append(out, ip)
 	}
 	return out
 }
 
-// packBytesToIPv4 splits data into 4-byte chunks. last chunk is zero-padded.
+// packBytesToIPv4 splits data into 3-byte chunks with a 1-byte index prefix.
 func packBytesToIPv4(b []byte) [][4]byte {
 	if len(b) == 0 {
 		return [][4]byte{{}}
 	}
-	chunks := (len(b) + 3) / 4
+	chunks := (len(b) + 2) / 3
+	if chunks > 255 {
+		chunks = 255
+	}
 	out := make([][4]byte, 0, chunks)
 	for i := 0; i < chunks; i++ {
 		var ip [4]byte
-		start := i * 4
-		end := start + 4
+		ip[0] = byte(i + 1)
+		start := i * 3
+		end := start + 3
 		if end > len(b) {
 			end = len(b)
 		}
-		copy(ip[:], b[start:end])
+		copy(ip[1:], b[start:end])
 		out = append(out, ip)
 	}
 	return out
 }
 
 // ───────────────────────── Utils ─────────────────────────
+
+func isBase32ID(s string) bool {
+	if len(s) != 5 {
+		return false
+	}
+	for _, r := range s {
+		if r < 'a' || r > 'z' {
+			if r < '2' || r > '7' {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 func atoiSafe(s string) int {
 	n := 0

@@ -8,7 +8,6 @@ import 'package:base32/base32.dart';
 // Core layers
 import '../core/protocol.dart';
 import '../core/crypto.dart';
-import '../core/dns_codec.dart';
 import '../core/rx_assembly.dart';
 import '../core/transport.dart';
 import '../utils/id.dart';
@@ -46,6 +45,8 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
 
   bool _pollingEnabled = true;
   bool _debugMode = false;
+  bool _fallbackEnabled = false;
+  bool _useDirectServer = false;
   int _pollMin = 20;
   int _pollMax = 40;
   int _retryCount = 1;
@@ -80,6 +81,8 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       _retryCount = prefs.getInt('retry_count') ?? 1;
       _pollingEnabled = prefs.getBool('polling_enabled') ?? true;
       _debugMode = prefs.getBool('debug_mode') ?? false;
+      _fallbackEnabled = prefs.getBool('fallback_enabled') ?? false;
+      _useDirectServer = prefs.getBool('use_direct_server') ?? false;
 
       if (prefs.getString('my_id') == null) prefs.setString('my_id', _myID);
     });
@@ -102,15 +105,16 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       final encrypted = await PeykCrypto.encrypt(text);
       final b32 = base32.encode(encrypted).toLowerCase().replaceAll('=', '');
       final chunks = _makeChunks(b32);
-      final transport = DnsTransport(_serverIP);
+      final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
+      final mid = IdUtils.generateRandomID();
 
-      final ackKey = "${_myID.toLowerCase()}:${chunks.length}";
+      final ackKey = "${_myID.toLowerCase()}:${chunks.length}:$mid";
       _pendingDelivery[ackKey] = 0;
 
       for (int i = 0; i < chunks.length; i++) {
-        final label = "${i + 1}-${chunks.length}-$_myID-$_targetID-${chunks[i]}";
+        final label = "${i + 1}-${chunks.length}-$mid-$_myID-$_targetID-${chunks[i]}";
         for (int r = 0; r <= _retryCount; r++) {
-          await transport.sendOnly(DnsCodec.buildQuery("$label.$_baseDomain", qtype: 1)); // Always Send via A
+          await transport.sendOnly("$label.$_baseDomain", qtype: 1);
         }
       }
       setState(() {
@@ -179,23 +183,22 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     setState(() => _status = NodeStatus.polling);
     _gcBuffers();
 
-    final transport = DnsTransport(_serverIP);
+    final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
     bool hasMore = true;
 
     while (hasMore) {
       // 1) Try AAAA
-      var query = DnsCodec.buildQuery("v1.sync.$_myID.$_baseDomain", qtype: 28);
-      var response = await transport.sendAndReceive(query);
+      final pollNonce = IdUtils.generateRandomID();
+      var response = await transport.sendAndReceive("v1.sync.$_myID.$pollNonce.$_baseDomain", qtype: 28);
 
-      // 2) Fallback to A
-      if (response == null || DnsCodec.extractAllBytes(response).isEmpty) {
-        query = DnsCodec.buildQuery("v1.sync.$_myID.$_baseDomain", qtype: 1);
-        response = await transport.sendAndReceive(query);
+      // 2) Fallback to A only if no response
+      if (response == null && _fallbackEnabled) {
+        response = await transport.sendAndReceive("v1.sync.$_myID.$pollNonce.$_baseDomain", qtype: 1);
       }
 
       if (response == null) break;
 
-      final rawBytes = DnsCodec.extractAllBytes(response);
+      final rawBytes = response;
       final txt = _bytesToText(rawBytes);
 
       if (txt.isEmpty || txt == "NOP") {
@@ -237,8 +240,11 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
 
   void _handleDeliveryAck(String txt) {
     final parts = txt.split("-");
-    if (parts.length != 3) return;
-    final key = "${parts[1].toLowerCase()}:${parts[2]}";
+    if (parts.length != 3 && parts.length != 4) return;
+    final sid = parts[1].toLowerCase();
+    final tot = parts[2];
+    final mid = parts.length == 4 ? parts[3].toLowerCase() : "";
+    final key = mid.isEmpty ? "$sid:$tot" : "$sid:$tot:$mid";
     final msgIndex = _pendingDelivery[key];
     if (msgIndex != null && msgIndex < _messages.length) {
       setState(() => _messages[msgIndex]["status"] = "delivered");
@@ -262,26 +268,44 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
 
       // If header is rotated to the end (out-of-order DNS answers), rotate it back.
       if (!RegExp(r'^\d+-').hasMatch(cleanTxt)) {
-        final headerMatch = RegExp(r'\d+-\d+-[a-z2-7]{5}-[a-z2-7]{5}-').firstMatch(cleanTxt);
+        final headerMatch = RegExp(r'\d+-\d+-[a-z2-7]{5}-[a-z2-7]{5}-[a-z2-7]{5}-').firstMatch(cleanTxt) ??
+            RegExp(r'\d+-\d+-[a-z2-7]{5}-[a-z2-7]{5}-').firstMatch(cleanTxt);
         if (headerMatch != null && headerMatch.start > 0) {
           cleanTxt = cleanTxt.substring(headerMatch.start) + cleanTxt.substring(0, headerMatch.start);
         }
       }
 
       // ۲) فریم باید کامل باشد: idx-tot-sid-rid-payload
-      final regex = RegExp(r'^(\d+)-(\d+)-([a-z2-7]{5})-([a-z2-7]{5})-([a-z2-7]+)$');
-      final match = regex.firstMatch(cleanTxt);
-
-      if (match == null) {
+      final parts = cleanTxt.split("-");
+      if (parts.length != 5 && parts.length != 6) {
         if (_debugMode) print("DEBUG: Still no match for: $cleanTxt");
         return;
       }
 
-      final idx = int.parse(match.group(1)!);
-      final tot = int.parse(match.group(2)!);
-      final sid = match.group(3)!.toLowerCase();
-      final rid = match.group(4)!.toLowerCase();
-      String payload = (match.group(5) ?? "").trim();
+      final idx = int.tryParse(parts[0]);
+      final tot = int.tryParse(parts[1]);
+      String mid = "";
+      String sid = "";
+      String rid = "";
+      String payload = "";
+
+      if (parts.length == 6) {
+        mid = parts[2].toLowerCase();
+        sid = parts[3].toLowerCase();
+        rid = parts[4].toLowerCase();
+        payload = parts[5].trim();
+      } else {
+        sid = parts[2].toLowerCase();
+        rid = parts[3].toLowerCase();
+        payload = parts[4].trim();
+      }
+
+      final idRe = RegExp(r'^[a-z2-7]{5}$');
+      final payloadRe = RegExp(r'^[a-z2-7]+$');
+      if (idx == null || tot == null) return;
+      if (!idRe.hasMatch(sid) || !idRe.hasMatch(rid)) return;
+      if (mid.isNotEmpty && !idRe.hasMatch(mid)) return;
+      if (!payloadRe.hasMatch(payload)) return;
 
       if (rid != _myID.toLowerCase()) return;
 
@@ -291,7 +315,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
         return;
       }
 
-      final bufKey = "$sid:$rid:$tot";
+      final bufKey = mid.isEmpty ? "$sid:$rid:$tot" : "$sid:$rid:$tot:$mid";
       final st = _buffers.putIfAbsent(bufKey, () => _RxBufferState(RxAssembly(sid, tot)));
       st.lastUpdatedAt = DateTime.now();
 
@@ -356,8 +380,9 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
           });
 
           // ACK2 (A)
-          final transport = DnsTransport(_serverIP);
-          await transport.sendOnly(DnsCodec.buildQuery("ack2-$sid-$tot.$_baseDomain", qtype: 1));
+          final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
+          final ackLabel = mid.isEmpty ? "ack2-$sid-$tot" : "ack2-$sid-$tot-$mid";
+          await transport.sendOnly("$ackLabel.$_baseDomain", qtype: 1);
         } catch (e) {
           if (_debugMode) print("❌ Decryption/Base32 Error: $e");
         }
@@ -393,8 +418,22 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       width: double.infinity,
       color: Colors.black,
       padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 12),
-      child: Text("SYS_STATUS: ${_status.name.toUpperCase()} | NODE: $_myID",
-          style: const TextStyle(color: Color(0xFF00A884), fontSize: 9, fontFamily: 'monospace')),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text("SYS_STATUS: ${_status.name.toUpperCase()} | NODE: $_myID",
+                style: const TextStyle(color: Color(0xFF00A884), fontSize: 9, fontFamily: 'monospace')),
+          ),
+          if (!_pollingEnabled)
+            IconButton(
+              icon: const Icon(Icons.sync, size: 14, color: Color(0xFF00A884)),
+              tooltip: "Manual Sync",
+              onPressed: _fetchBuffer,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
+            ),
+        ],
+      ),
     );
   }
 
@@ -538,7 +577,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                 ),
                 const Divider(color: Colors.white10, height: 25),
                 _buildSettingField(targetCtrl, "Target Node ID", Icons.person_pin, "abcde"),
-                _buildSettingField(ipCtrl, "Relay Server IP", Icons.lan, "1.2.3.4"),
+                _buildSettingField(ipCtrl, "Relay Server IP", Icons.lan, "1.2.3.4", enabled: _useDirectServer),
                 _buildSettingField(domainCtrl, "Base Domain", Icons.dns, "p99.peyk-d.ir"),
                 Row(children: [
                   Expanded(child: _buildSettingField(pollMinCtrl, "Min Poll", Icons.timer_outlined, "20", isNum: true)),
@@ -546,6 +585,13 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                   Expanded(child: _buildSettingField(pollMaxCtrl, "Max Poll", Icons.timer, "40", isNum: true)),
                 ]),
                 _buildSettingField(retryCtrl, "Retries", Icons.repeat, "1", isNum: true),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text("Use Direct Server IP", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                  value: _useDirectServer,
+                  activeColor: const Color(0xFF00A884),
+                  onChanged: (v) => setL(() => _useDirectServer = v),
+                ),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text("Active Polling", style: TextStyle(fontSize: 12, color: Colors.white70)),
@@ -559,6 +605,13 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                   value: _debugMode,
                   activeColor: Colors.orange,
                   onChanged: (v) => setL(() => _debugMode = v),
+                ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text("A Fallback on No Response", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                  value: _fallbackEnabled,
+                  activeColor: const Color(0xFF00A884),
+                  onChanged: (v) => setL(() => _fallbackEnabled = v),
                 ),
               ],
             ),
@@ -576,6 +629,8 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                 await prefs.setInt('retry_count', int.tryParse(retryCtrl.text) ?? 1);
                 await prefs.setBool('polling_enabled', _pollingEnabled);
                 await prefs.setBool('debug_mode', _debugMode);
+                await prefs.setBool('fallback_enabled', _fallbackEnabled);
+                await prefs.setBool('use_direct_server', _useDirectServer);
                 _loadSettings();
                 if (context.mounted) Navigator.pop(context);
               },
@@ -587,10 +642,11 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     );
   }
 
-  Widget _buildSettingField(TextEditingController ctrl, String label, IconData icon, String hint, {bool isNum = false}) {
+  Widget _buildSettingField(TextEditingController ctrl, String label, IconData icon, String hint, {bool isNum = false, bool enabled = true}) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
       child: TextField(
+        enabled: enabled,
         controller: ctrl,
         keyboardType: isNum ? TextInputType.number : TextInputType.text,
         style: const TextStyle(fontSize: 13),

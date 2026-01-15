@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,8 +29,11 @@ const (
 
 	// Direct server IP for DNS queries (bypasses recursive DNS)
 	// Set to empty string "" to use system recursive DNS instead
-	DIRECT_SERVER_IP   = "127.0.0.1"
+	DIRECT_SERVER_IP   = ""
 	DIRECT_SERVER_PORT = 53
+
+	// Fallback to A only when enabled and no response received
+	ENABLE_A_FALLBACK = false
 )
 
 // RX buffers: key = "sid-rid-tot" -> idx->payload
@@ -59,6 +63,17 @@ var resolver4 = &net.Resolver{
 		d := net.Dialer{Timeout: 1200 * time.Millisecond}
 		return d.DialContext(ctx, "udp4", address)
 	},
+}
+
+func generateID() string {
+	const chars = "abcdefghijklmnopqrstuvwxyz234567"
+	b := make([]byte, 5)
+	seed := time.Now().UnixNano()
+	for i := 0; i < 5; i++ {
+		seed = (seed*1664525 + 1013904223) & 0x7fffffff
+		b[i] = chars[seed%int64(len(chars))]
+	}
+	return string(b)
 }
 
 func main() {
@@ -96,7 +111,7 @@ func startPolling() {
 	backoff := minBackoff
 
 	for {
-		queryDomain := fmt.Sprintf("v1.sync.%s.%s", MY_ID, BASE_DOMAIN)
+		queryDomain := fmt.Sprintf("v1.sync.%s.%s.%s", MY_ID, generateID(), BASE_DOMAIN)
 
 		var txt string
 
@@ -151,12 +166,17 @@ func pollDirect(domain string) string {
 	n, err := conn.Read(buf)
 	if err == nil && n > 12 {
 		txt := extractPayloadFromDNSResponse(buf[:n])
-		if txt != "" && txt != "NOP" {
+		if txt != "" {
 			return txt
 		}
+		if !ENABLE_A_FALLBACK {
+			return ""
+		}
+	} else if !ENABLE_A_FALLBACK {
+		return ""
 	}
 
-	// Fallback to A
+	// Fallback to A (only if enabled)
 	query = buildDNSQuery(domain, 1) // A
 	conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
 	_, err = conn.Write(query)
@@ -183,8 +203,14 @@ func pollRecursive(domain string) string {
 		if txt != "" {
 			return txt
 		}
+		if !ENABLE_A_FALLBACK {
+			return ""
+		}
+	} else if !ENABLE_A_FALLBACK {
+		return ""
 	}
 
+	// Fallback to A (only if enabled)
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	ips4, err4 := resolver4.LookupIP(ctx2, "ip4", domain)
 	cancel2()
@@ -257,7 +283,9 @@ func extractPayloadFromDNSResponse(data []byte) string {
 	}
 	i += 4 // QTYPE + QCLASS
 
-	var payload []byte
+	var legacy []byte
+	indexed := make(map[byte][]byte)
+	hasIndex0 := false
 
 	// Parse answers
 	for a := 0; a < ancount && i+10 <= len(data); a++ {
@@ -289,10 +317,34 @@ func extractPayloadFromDNSResponse(data []byte) string {
 
 		// A (4 bytes) or AAAA (16 bytes)
 		if rtype == 1 || rtype == 28 {
-			payload = append(payload, data[i:i+rdlen]...)
+			raw := data[i : i+rdlen]
+			legacy = append(legacy, raw...)
+			if len(raw) >= 2 && raw[0] > 0 {
+				idx := raw[0] - 1
+				if _, ok := indexed[idx]; !ok {
+					indexed[idx] = append([]byte{}, raw[1:]...)
+					if idx == 0 {
+						hasIndex0 = true
+					}
+				}
+			}
 		}
 
 		i += rdlen
+	}
+
+	payload := legacy
+	if len(indexed) > 0 && hasIndex0 {
+		keys := make([]int, 0, len(indexed))
+		for k := range indexed {
+			keys = append(keys, int(k))
+		}
+		sort.Ints(keys)
+		var rebuilt []byte
+		for _, k := range keys {
+			rebuilt = append(rebuilt, indexed[byte(k)]...)
+		}
+		payload = rebuilt
 	}
 
 	// Trim trailing null bytes
@@ -305,13 +357,47 @@ func extractPayloadFromDNSResponse(data []byte) string {
 
 // extractPayloadFromIPs extracts bytes from IP addresses (for recursive mode)
 func extractPayloadFromIPs(ips []net.IP) string {
-	var buf []byte
+	var legacy []byte
+	indexed := make(map[byte][]byte)
+	hasIndex0 := false
 	for _, ip := range ips {
 		if ip4 := ip.To4(); ip4 != nil {
-			buf = append(buf, ip4...)
+			legacy = append(legacy, ip4...)
+			if len(ip4) >= 2 && ip4[0] > 0 {
+				idx := ip4[0] - 1
+				if _, ok := indexed[idx]; !ok {
+					indexed[idx] = append([]byte{}, ip4[1:]...)
+					if idx == 0 {
+						hasIndex0 = true
+					}
+				}
+			}
 		} else if ip16 := ip.To16(); ip16 != nil {
-			buf = append(buf, ip16...)
+			legacy = append(legacy, ip16...)
+			if len(ip16) >= 2 && ip16[0] > 0 {
+				idx := ip16[0] - 1
+				if _, ok := indexed[idx]; !ok {
+					indexed[idx] = append([]byte{}, ip16[1:]...)
+					if idx == 0 {
+						hasIndex0 = true
+					}
+				}
+			}
 		}
+	}
+
+	buf := legacy
+	if len(indexed) > 0 && hasIndex0 {
+		keys := make([]int, 0, len(indexed))
+		for k := range indexed {
+			keys = append(keys, int(k))
+		}
+		sort.Ints(keys)
+		var rebuilt []byte
+		for _, k := range keys {
+			rebuilt = append(rebuilt, indexed[byte(k)]...)
+		}
+		buf = rebuilt
 	}
 	// Trim trailing null bytes
 	for len(buf) > 0 && buf[len(buf)-1] == 0 {
@@ -340,9 +426,9 @@ func sendDirectDNSQuery(domain string, qtype uint16) {
 
 // ✅ Parse ACK2 and compute Peyk latency if it's for our outgoing message
 func handleAck2Metric(txt string) {
-	// format: ACK2-<sid>-<tot>
+	// format: ACK2-<sid>-<tot> or ACK2-<sid>-<tot>-<mid>
 	parts := strings.Split(txt, "-")
-	if len(parts) != 3 {
+	if len(parts) != 3 && len(parts) != 4 {
 		return
 	}
 
@@ -351,14 +437,17 @@ func handleAck2Metric(txt string) {
 	if err != nil || tot <= 0 {
 		return
 	}
-
-	// Only measure latency for ACK2s that confirm messages WE sent.
-	// (Those have sid == MY_ID)
-	if sid != strings.ToLower(MY_ID) {
-		return
+	mid := ""
+	if len(parts) == 4 {
+		mid = strings.ToLower(parts[3])
 	}
 
-	key := fmt.Sprintf("%s:%d", sid, tot)
+	key := ""
+	if mid != "" {
+		key = fmt.Sprintf("%s:%d:%s", sid, tot, mid)
+	} else {
+		key = fmt.Sprintf("%s:%d", sid, tot)
+	}
 
 	txMu.Lock()
 	start, ok := txStartAt[key]
@@ -392,9 +481,21 @@ func handleIncomingChunk(txt string) {
 		return
 	}
 
-	senderID := strings.ToLower(parts[2])
-	receiverID := strings.ToLower(parts[3])
-	payload := strings.Join(parts[4:], "-")
+	mid := ""
+	senderID := ""
+	receiverID := ""
+	payload := ""
+
+	if len(parts) >= 6 && len(parts[2]) == 5 && len(parts[3]) == 5 && len(parts[4]) == 5 {
+		mid = strings.ToLower(parts[2])
+		senderID = strings.ToLower(parts[3])
+		receiverID = strings.ToLower(parts[4])
+		payload = strings.Join(parts[5:], "-")
+	} else {
+		senderID = strings.ToLower(parts[2])
+		receiverID = strings.ToLower(parts[3])
+		payload = strings.Join(parts[4:], "-")
+	}
 
 	if receiverID != strings.ToLower(MY_ID) {
 		return
@@ -403,7 +504,12 @@ func handleIncomingChunk(txt string) {
 		return
 	}
 
-	key := fmt.Sprintf("%s-%s-%d", senderID, receiverID, total)
+	key := ""
+	if mid != "" {
+		key = fmt.Sprintf("%s-%s-%d-%s", senderID, receiverID, total, mid)
+	} else {
+		key = fmt.Sprintf("%s-%s-%d", senderID, receiverID, total)
+	}
 
 	buffersMu.Lock()
 	if _, ok := buffers[key]; !ok {
@@ -416,11 +522,11 @@ func handleIncomingChunk(txt string) {
 	fmt.Printf("📦 [RX] Chunk %d/%d from %s (have %d/%d)\n", idx, total, senderID, got, total)
 
 	if got == total {
-		assembleAndDecrypt(key, total, senderID)
+		assembleAndDecrypt(key, total, senderID, mid)
 	}
 }
 
-func assembleAndDecrypt(key string, total int, senderID string) {
+func assembleAndDecrypt(key string, total int, senderID string, mid string) {
 	// copy out under lock
 	buffersMu.Lock()
 	chunks, ok := buffers[key]
@@ -453,7 +559,7 @@ func assembleAndDecrypt(key string, total int, senderID string) {
 	if isDuplicateAndMark(dupKey) {
 		fmt.Printf("🔁 DUPLICATE (content-hash) ignored %s\n", dupKey)
 		// Still ACK2 (best-effort) to help sender stop resending
-		go retryAck2Stable(senderID, total)
+		go retryAck2Stable(senderID, total, mid)
 		return
 	}
 
@@ -473,7 +579,7 @@ func assembleAndDecrypt(key string, total int, senderID string) {
 	fmt.Printf("\n📩 NEW MESSAGE [%s]: %s\n\n", senderID, decrypted)
 
 	// ACK2 (stable format: ack2-sid-tot)
-	go retryAck2Stable(senderID, total)
+	go retryAck2Stable(senderID, total, mid)
 }
 
 // Dedup with TTL cleanup
@@ -502,8 +608,13 @@ func isDuplicateAndMark(k string) bool {
 // Send "ack2-<sid>-<tot>.<base>" (no RID) — matches stable server.
 // Retry a few times (best-effort) because DNS can drop.
 
-func retryAck2Stable(senderID string, total int) {
-	domain := fmt.Sprintf("ack2-%s-%d.%s", strings.ToLower(senderID), total, BASE_DOMAIN)
+func retryAck2Stable(senderID string, total int, mid string) {
+	domain := ""
+	if mid != "" {
+		domain = fmt.Sprintf("ack2-%s-%d-%s.%s", strings.ToLower(senderID), total, mid, BASE_DOMAIN)
+	} else {
+		domain = fmt.Sprintf("ack2-%s-%d.%s", strings.ToLower(senderID), total, BASE_DOMAIN)
+	}
 
 	for i := 0; i < 3; i++ {
 		if DIRECT_SERVER_IP != "" {
@@ -516,7 +627,11 @@ func retryAck2Stable(senderID string, total int) {
 		time.Sleep(350 * time.Millisecond)
 	}
 
-	fmt.Printf("📨 ACK2 sent for %s/%d (stable)\n", senderID, total)
+	if mid != "" {
+		fmt.Printf("ACK2 sent for %s/%d mid=%s (stable)\n", senderID, total, mid)
+	} else {
+		fmt.Printf("ACK2 sent for %s/%d (stable)\n", senderID, total)
+	}
 }
 
 // ───────────────────────── TX (Send) ─────────────────────────
@@ -544,10 +659,11 @@ func sendManualMessage(msg string) {
 func sendChunks(data string) {
 	chunkSize := 30 // Match Flutter client chunk size
 	total := (len(data) + chunkSize - 1) / chunkSize
+	mid := generateID()
 
 	// ✅ record Peyk TX start time for latency metric
 	// key is "<MY_ID>:<tot>", matching server ACK2 format: ACK2-<sid>-<tot>
-	txKey := fmt.Sprintf("%s:%d", strings.ToLower(MY_ID), total)
+	txKey := fmt.Sprintf("%s:%d:%s", strings.ToLower(MY_ID), total, mid)
 	txMu.Lock()
 	txStartAt[txKey] = time.Now()
 	txMu.Unlock()
@@ -564,7 +680,7 @@ func sendChunks(data string) {
 			end = len(data)
 		}
 
-		label := fmt.Sprintf("%d-%d-%s-%s-%s", i+1, total, MY_ID, TARGET_ID, data[start:end])
+		label := fmt.Sprintf("%d-%d-%s-%s-%s-%s", i+1, total, mid, MY_ID, TARGET_ID, data[start:end])
 		host := label + "." + BASE_DOMAIN
 
 		startTime := time.Now()
