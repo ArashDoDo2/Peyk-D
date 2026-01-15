@@ -1,4 +1,5 @@
 import 'dart:typed_data';
+import 'dart:convert';
 import 'dart:async';
 import 'dart:math';
 import 'package:flutter/material.dart';
@@ -25,7 +26,10 @@ class _RxBufferState {
 }
 
 class ChatScreen extends StatefulWidget {
-  const ChatScreen({super.key});
+  final String targetId;
+  final String? displayName;
+
+  const ChatScreen({super.key, required this.targetId, this.displayName});
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
@@ -36,6 +40,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   final List<Map<String, dynamic>> _messages = [];
   final Map<String, _RxBufferState> _buffers = {};
   final Map<String, int> _pendingDelivery = {};
+  Map<String, String> _contactNames = {};
 
   String _myID = '';
   String _targetID = '';
@@ -56,6 +61,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   late Animation<double> _glowAnim;
 
   static const Duration _bufferTtl = Duration(seconds: 90);
+  static const int _historyMax = 200;
 
   @override
   void initState() {
@@ -71,9 +77,25 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
 
   Future<void> _loadSettings() async {
     final prefs = await SharedPreferences.getInstance();
+    final namesRaw = prefs.getString('contacts_names');
+    Map<String, String> names = {};
+    if (namesRaw != null && namesRaw.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(namesRaw);
+        if (decoded is Map) {
+          for (final entry in decoded.entries) {
+            final key = entry.key.toString().toLowerCase();
+            final val = entry.value.toString();
+            if (val.isNotEmpty) names[key] = val;
+          }
+        }
+      } catch (_) {
+        // ignore bad names
+      }
+    }
     setState(() {
       _myID = prefs.getString('my_id') ?? IdUtils.generateRandomID();
-      _targetID = prefs.getString('target_id') ?? '';
+      _targetID = widget.targetId;
       _serverIP = prefs.getString('server_ip') ?? PeykProtocol.defaultServerIP;
       _baseDomain = prefs.getString('base_domain') ?? PeykProtocol.baseDomain;
       _pollMin = prefs.getInt('poll_min') ?? 20;
@@ -83,10 +105,39 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       _debugMode = prefs.getBool('debug_mode') ?? false;
       _fallbackEnabled = prefs.getBool('fallback_enabled') ?? false;
       _useDirectServer = prefs.getBool('use_direct_server') ?? false;
+      _contactNames = names;
 
       if (prefs.getString('my_id') == null) prefs.setString('my_id', _myID);
     });
+    await _loadHistory();
     _startPolling();
+  }
+
+  String _historyKey() => "chat_history_${_myID.toLowerCase()}_${_targetID.toLowerCase()}";
+
+  Future<void> _loadHistory() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_historyKey());
+    if (raw == null || raw.isEmpty) return;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is List) {
+        final items = decoded.whereType<Map>().map((m) => Map<String, dynamic>.from(m)).toList();
+        setState(() {
+          _messages
+            ..clear()
+            ..addAll(items);
+        });
+      }
+    } catch (_) {
+      // ignore bad history
+    }
+  }
+
+  Future<void> _saveHistory() async {
+    final prefs = await SharedPreferences.getInstance();
+    final data = _messages.take(_historyMax).toList();
+    await prefs.setString(_historyKey(), jsonEncode(data));
   }
 
   // ───────────────────────── SEND ─────────────────────────
@@ -100,6 +151,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       _messages.insert(0, {"text": text, "status": "sending", "time": _getTime()});
       _status = NodeStatus.sending;
     });
+    await _saveHistory();
 
     try {
       final encrypted = await PeykCrypto.encrypt(text);
@@ -122,6 +174,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
         _messages[0]["status"] = "sent";
         _status = NodeStatus.success;
       });
+      await _saveHistory();
     } catch (e) {
       setState(() => _status = NodeStatus.error);
     }
@@ -251,6 +304,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       for (int i = 0; i < _messages.length; i++) {
         if (_messages[i]["deliveryKey"] == key) {
           setState(() => _messages[i]["status"] = "delivered");
+          _saveHistory();
           break;
         }
       }
@@ -314,6 +368,10 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       if (!payloadRe.hasMatch(payload)) return;
 
       if (rid != _myID.toLowerCase()) return;
+      if (sid == _myID.toLowerCase()) {
+        if (_debugMode) print("DEBUG: Dropped loopback frame from self: $cleanTxt");
+        return;
+      }
 
       // ✅ DROP empty payloads (prevents empty base32 / decoded bytes 0)
       if (payload.isEmpty) {
@@ -372,6 +430,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                 "time": _getTime(),
               });
             });
+            _saveHistory();
             return;
           }
 
@@ -384,6 +443,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
               "time": _getTime(),
             });
           });
+          _saveHistory();
 
           // ACK2 (A)
           final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
@@ -401,13 +461,51 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
 
   String _getTime() => "${DateTime.now().hour}:${DateTime.now().minute.toString().padLeft(2, '0')}";
 
+  String _displayNameForId(String id) {
+    final key = id.toLowerCase();
+    return _contactNames[key] ?? id;
+  }
+
+  Future<void> _clearHistory() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_historyKey());
+    if (!mounted) return;
+    setState(() => _messages.clear());
+  }
+
+  Future<void> _confirmClearHistory() async {
+    if (!mounted) return;
+    await showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF182229),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16), side: BorderSide(color: const Color(0xFF00A884).withOpacity(0.3))),
+        title: const Text("CLEAR CHAT", style: TextStyle(fontSize: 12, letterSpacing: 2, fontWeight: FontWeight.bold, color: Color(0xFF00A884))),
+        content: const Text("This will remove local history for this chat.", style: TextStyle(color: Colors.white70, fontSize: 12)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("CANCEL", style: TextStyle(color: Colors.white30))),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00A884), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
+            onPressed: () async {
+              await _clearHistory();
+              if (context.mounted) Navigator.pop(context);
+            },
+            child: const Text("CLEAR", style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+
   // ───────────────────────── UI (بدون تغییر گرافیکی) ─────────────────────────
 
   @override
   Widget build(BuildContext context) {
+    final title = widget.displayName?.isNotEmpty == true ? widget.displayName! : _targetID;
     return Scaffold(
       appBar: AppBar(
-        title: const Text("PEYK-D TERMINAL", style: TextStyle(letterSpacing: 3, fontSize: 12, fontWeight: FontWeight.bold)),
+        title: Text("CHAT: $title", style: const TextStyle(letterSpacing: 2, fontSize: 12, fontWeight: FontWeight.bold)),
         actions: [IconButton(icon: const Icon(Icons.settings, size: 20), onPressed: _showSettings)],
       ),
       body: Column(
@@ -471,7 +569,10 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
           crossAxisAlignment: isRx ? CrossAxisAlignment.start : CrossAxisAlignment.end,
           children: [
             if (isRx)
-              Text(msg["from"], style: const TextStyle(color: Color(0xFF00A884), fontSize: 8, fontWeight: FontWeight.bold)),
+              Text(
+                _displayNameForId((msg["from"] ?? "").toString()),
+                style: const TextStyle(color: Color(0xFF00A884), fontSize: 8, fontWeight: FontWeight.bold),
+              ),
             Text(msg["text"], style: const TextStyle(color: Colors.white)),
             const SizedBox(height: 4),
             Row(
@@ -582,48 +683,99 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                     Text("Arash, MEL - Jan2026", style: TextStyle(fontSize: 10, fontFamily: 'monospace', color: Colors.white54)),
                   ],
                 ),
-                const Divider(color: Colors.white10, height: 25),
-                _buildSettingField(targetCtrl, "Target Node ID", Icons.person_pin, "abcde"),
-                _buildSettingField(ipCtrl, "Relay Server IP", Icons.lan, "1.2.3.4", enabled: _useDirectServer),
-                _buildSettingField(domainCtrl, "Base Domain", Icons.dns, "p99.peyk-d.ir"),
-                Row(children: [
-                  Expanded(child: _buildSettingField(pollMinCtrl, "Min Poll", Icons.timer_outlined, "20", isNum: true)),
-                  const SizedBox(width: 10),
-                  Expanded(child: _buildSettingField(pollMaxCtrl, "Max Poll", Icons.timer, "40", isNum: true)),
-                ]),
-                _buildSettingField(retryCtrl, "Retries", Icons.repeat, "1", isNum: true),
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text("Use Direct Server IP", style: TextStyle(fontSize: 12, color: Colors.white70)),
-                  value: _useDirectServer,
-                  activeColor: const Color(0xFF00A884),
-                  onChanged: (v) => setL(() => _useDirectServer = v),
+                const SizedBox(height: 10),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
+                  decoration: BoxDecoration(
+                    color: Colors.black26,
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: Colors.white10),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text("CONNECTION", style: TextStyle(fontSize: 10, letterSpacing: 2, color: Colors.white38)),
+                      const SizedBox(height: 6),
+                      _buildSettingField(targetCtrl, "Target Node ID", Icons.person_pin, "abcde", enabled: false),
+                      _buildSettingField(ipCtrl, "Relay Server IP", Icons.lan, "1.2.3.4", enabled: _useDirectServer),
+                      _buildSettingField(domainCtrl, "Base Domain", Icons.dns, "p99.peyk-d.ir"),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text("Use Direct Server IP", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                        value: _useDirectServer,
+                        activeColor: const Color(0xFF00A884),
+                        onChanged: (v) => setL(() => _useDirectServer = v),
+                      ),
+                    ],
+                  ),
                 ),
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text("Active Polling", style: TextStyle(fontSize: 12, color: Colors.white70)),
-                  value: _pollingEnabled,
-                  activeColor: const Color(0xFF00A884),
-                  onChanged: (v) => setL(() => _pollingEnabled = v),
+                const SizedBox(height: 10),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
+                  decoration: BoxDecoration(
+                    color: Colors.black26,
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: Colors.white10),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text("POLLING", style: TextStyle(fontSize: 10, letterSpacing: 2, color: Colors.white38)),
+                      const SizedBox(height: 6),
+                      Row(children: [
+                        Expanded(child: _buildSettingField(pollMinCtrl, "Min Poll", Icons.timer_outlined, "20", isNum: true)),
+                        const SizedBox(width: 10),
+                        Expanded(child: _buildSettingField(pollMaxCtrl, "Max Poll", Icons.timer, "40", isNum: true)),
+                      ]),
+                      _buildSettingField(retryCtrl, "Retries", Icons.repeat, "1", isNum: true),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text("Active Polling", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                        value: _pollingEnabled,
+                        activeColor: const Color(0xFF00A884),
+                        onChanged: (v) => setL(() => _pollingEnabled = v),
+                      ),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text("A Fallback on No Response", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                        value: _fallbackEnabled,
+                        activeColor: const Color(0xFF00A884),
+                        onChanged: (v) => setL(() => _fallbackEnabled = v),
+                      ),
+                    ],
+                  ),
                 ),
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text("Debug Mode", style: TextStyle(fontSize: 12, color: Colors.white70)),
-                  value: _debugMode,
-                  activeColor: Colors.orange,
-                  onChanged: (v) => setL(() => _debugMode = v),
-                ),
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text("A Fallback on No Response", style: TextStyle(fontSize: 12, color: Colors.white70)),
-                  value: _fallbackEnabled,
-                  activeColor: const Color(0xFF00A884),
-                  onChanged: (v) => setL(() => _fallbackEnabled = v),
+                const SizedBox(height: 10),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
+                  decoration: BoxDecoration(
+                    color: Colors.black26,
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: Colors.white10),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text("DEBUG", style: TextStyle(fontSize: 10, letterSpacing: 2, color: Colors.white38)),
+                      const SizedBox(height: 6),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text("Debug Mode", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                        value: _debugMode,
+                        activeColor: Colors.orange,
+                        onChanged: (v) => setL(() => _debugMode = v),
+                      ),
+                    ],
+                  ),
                 ),
               ],
             ),
           ),
           actions: [
+            TextButton(onPressed: _confirmClearHistory, child: const Text("CLEAR CHAT", style: TextStyle(color: Colors.orange))),
             TextButton(onPressed: () => Navigator.pop(context), child: const Text("DISCARD", style: TextStyle(color: Colors.white30))),
             ElevatedButton(
               style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00A884), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),

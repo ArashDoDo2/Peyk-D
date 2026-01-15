@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'ui/chat_screen.dart';
+import 'ui/contacts_screen.dart';
 
 class PeykDApp extends StatelessWidget {
   const PeykDApp({super.key});
@@ -18,7 +18,7 @@ class PeykDApp extends StatelessWidget {
         ),
         useMaterial3: true,
       ),
-      home: const ChatScreen(),
+      home: const ContactsScreen(),
     );
   }
 }
