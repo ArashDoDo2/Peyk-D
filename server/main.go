@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"encoding/binary"
@@ -26,6 +26,11 @@ const (
 	MESSAGE_TTL       = 24 * time.Hour
 	PAYLOAD_PREVIEW   = 24 // chars
 	ENABLE_STATS_LOG  = false
+	ENABLE_VERBOSE_LOG = false
+	ENABLE_POLL_LOG    = true
+	ENABLE_RX_CHUNK_LOG = false
+	ENABLE_ACK2_LOG     = false
+	ENABLE_GC_LOG       = true
 )
 
 // DNS Types
@@ -81,6 +86,12 @@ var (
 	statIgnored   uint64
 )
 
+func logIf(enabled bool, format string, args ...interface{}) {
+	if enabled {
+		log.Printf(format, args...)
+	}
+}
+
 // ───────────────────────── Main ─────────────────────────
 
 func main() {
@@ -96,7 +107,7 @@ func main() {
 	go garbageCollector()
 	go statsLogger()
 
-	log.Printf("🚀 [PEYK-D SERVER — DEBUG] Listening on %s:%d (UDP)\n", LISTEN_IP, LISTEN_PORT)
+    log.Printf("PEYK-D server listening on %s:%d (udp)", LISTEN_IP, LISTEN_PORT)
 
 	buf := make([]byte, 512)
 	for {
@@ -174,7 +185,7 @@ func handlePacket(conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
 	txID := data[:2]
 	txIDHex := fmt.Sprintf("%02x%02x", txID[0], txID[1])
 
-	log.Printf("📥 RX pkt from=%s txid=%s qtype=%d qname=%s", addr.String(), txIDHex, q.QType, domain)
+    logIf(ENABLE_VERBOSE_LOG, "RX pkt from=%s txid=%s qtype=%d qname=%s", addr.String(), txIDHex, q.QType, domain)
 
 	// Polling (NOW: AAAA preferred, fallback to A)
 	if strings.HasPrefix(domain, "v1.sync.") {
@@ -185,7 +196,7 @@ func handlePacket(conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
 		}
 		atomic.AddUint64(&statPollRequests, 1)
 		handlePolling(conn, addr, txID, domain, q.QType, q.QClass)
-		log.Printf("⏱️  done poll from=%s txid=%s took=%s", addr.String(), txIDHex, time.Since(start))
+    logIf(ENABLE_VERBOSE_LOG, "done poll from=%s txid=%s took=%s", addr.String(), txIDHex, time.Since(start))
 		return
 	}
 
@@ -195,7 +206,7 @@ func handlePacket(conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
 		return
 	}
 	handleInboundOrAck2(conn, addr, txID, domain, q.QType, q.QClass)
-	log.Printf("⏱️  done A from=%s txid=%s took=%s", addr.String(), txIDHex, time.Since(start))
+    logIf(ENABLE_VERBOSE_LOG, "done A from=%s txid=%s took=%s", addr.String(), txIDHex, time.Since(start))
 }
 
 // ───────────────────────── Inbound + ACK2 ─────────────────────────
@@ -235,9 +246,9 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 
 		atomic.AddUint64(&statRxAck2, 1)
 		if mid != "" {
-			log.Printf("? ACK2 stored sid=%s tot=%d mid=%s (queue=%d) from=%s", sid, tot, mid, queueLen, addr.String())
+            logIf(ENABLE_ACK2_LOG, "ACK2 stored sid=%s tot=%d mid=%s (queue=%d) from=%s", sid, tot, mid, queueLen, addr.String())
 		} else {
-			log.Printf("? ACK2 stored sid=%s tot=%d (queue=%d) from=%s", sid, tot, queueLen, addr.String())
+            logIf(ENABLE_ACK2_LOG, "ACK2 stored sid=%s tot=%d (queue=%d) from=%s", sid, tot, queueLen, addr.String())
 		}
 
 		// Keep ACK response as A with fixed ACK_IP (unchanged)
@@ -314,10 +325,10 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 
 	if dup {
 		atomic.AddUint64(&statRxDupChunks, 1)
-		log.Printf("⚠️  DUP chunk sid=%s->%s %d/%d from=%s", sid, rid, idx, tot, addr.String())
+        logIf(ENABLE_RX_CHUNK_LOG, "DUP chunk sid=%s->%s %d/%d from=%s", sid, rid, idx, tot, addr.String())
 	} else {
 		atomic.AddUint64(&statRxChunks, 1)
-		log.Printf("📩 RX chunk sid=%s->%s %d/%d payloadLen=%d key=%s chunksInKey=%d preview=%q",
+        logIf(ENABLE_RX_CHUNK_LOG, "RX chunk sid=%s->%s %d/%d payloadLen=%d key=%s chunksInKey=%d preview=%q",
 			sid, rid, idx, tot, len(payload), key, msgSize, preview(payload))
 	}
 
@@ -330,7 +341,7 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain string, qtype, qclass uint16) {
 	parts := strings.Split(domain, ".")
 	if len(parts) < 3 {
-		log.Printf("🟦 poll malformed qname=%s from=%s -> NOP", domain, addr.String())
+        logIf(ENABLE_VERBOSE_LOG, "poll malformed qname=%s from=%s -> NOP", domain, addr.String())
 		sendPollingPayload(conn, addr, txID, domain, "NOP", qtype, qclass)
 		return
 	}
@@ -348,7 +359,7 @@ func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain str
 		}
 		storeMu.Unlock()
 
-		log.Printf("🟩 poll rid=%s from=%s -> ACK2 (%s) remaining=%d viaQ=%d", rid, addr.String(), ack, remaining, qtype)
+        logIf(ENABLE_POLL_LOG, "poll rid=%s from=%s -> ACK2 (%s) remaining=%d viaQ=%d", rid, addr.String(), ack, remaining, qtype)
 		sendPollingPayload(conn, addr, txID, domain, ack, qtype, qclass)
 		return
 	}
@@ -357,7 +368,7 @@ func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain str
 	msgs, ok := messageStore[rid]
 	if !ok || len(msgs) == 0 {
 		storeMu.Unlock()
-		log.Printf("🟨 poll rid=%s from=%s -> NOP (no msgs) viaQ=%d", rid, addr.String(), qtype)
+
 		sendPollingPayload(conn, addr, txID, domain, "NOP", qtype, qclass)
 		return
 	}
@@ -389,7 +400,7 @@ func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain str
 		leftInKey := len(msgs[key])
 		storeMu.Unlock()
 
-		log.Printf("🟧 poll rid=%s from=%s -> CHUNK key=%s sent=%d/%d sid=%s payloadLen=%d leftInKey=%d viaQ=%d preview=%q",
+        logIf(ENABLE_POLL_LOG, "poll rid=%s from=%s -> CHUNK key=%s sent=%d/%d sid=%s payloadLen=%d leftInKey=%d viaQ=%d preview=%q",
 			rid, addr.String(), key, c.Idx, c.Tot, c.SID, len(c.Payload), leftInKey, qtype, preview(full))
 
 		sendPollingPayload(conn, addr, txID, domain, full, qtype, qclass)
@@ -457,7 +468,7 @@ func garbageCollector() {
 		storeMu.Unlock()
 
 		if expired > 0 || keysRemoved > 0 || ridsRemoved > 0 {
-			log.Printf("🧹 GC expired=%d chunks (before=%d after=%d) keysRemoved=%d ridsRemoved=%d ttl=%s",
+            logIf(ENABLE_GC_LOG, "GC expired=%d chunks (before=%d after=%d) keysRemoved=%d ridsRemoved=%d ttl=%s",
 				expired, beforeChunks, afterChunks, keysRemoved, ridsRemoved, MESSAGE_TTL)
 		}
 	}
