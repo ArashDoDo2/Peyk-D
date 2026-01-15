@@ -23,7 +23,7 @@ const (
 const (
 	DEBUG_STATS_EVERY = 10 * time.Second
 	GC_EVERY          = 20 * time.Second
-	MESSAGE_TTL       = 2 * time.Minute
+	MESSAGE_TTL       = 24 * time.Hour
 	PAYLOAD_PREVIEW   = 24 // chars
 	ENABLE_STATS_LOG  = false
 )
