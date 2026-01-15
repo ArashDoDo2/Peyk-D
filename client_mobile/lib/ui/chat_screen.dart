@@ -283,17 +283,6 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     );
   }
 
-  // (UI/legacy helper; not used for decoding anymore but kept)
-  String _sanitizeDnsText(String txt) {
-    // Keep only printable ASCII (32-126)
-    final buffer = StringBuffer();
-    for (int i = 0; i < txt.length; i++) {
-      final c = txt.codeUnitAt(i);
-      if (c >= 32 && c <= 126) buffer.writeCharCode(c);
-    }
-    return buffer.toString().trim();
-  }
-
   bool _looksLikePayload(String txt) {
     if (txt.isEmpty) return false;
     if (txt == "NOP") return true;
