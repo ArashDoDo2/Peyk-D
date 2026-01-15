@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:async';
 import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:base32/base32.dart';
 
@@ -41,6 +42,9 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   final Map<String, _RxBufferState> _buffers = {};
   final Map<String, int> _pendingDelivery = {};
   Map<String, String> _contactNames = {};
+  final ScrollController _chatScrollCtrl = ScrollController();
+  bool _showJumpToBottom = false;
+  static const String _unreadKey = 'contacts_unread';
 
   String _myID = '';
   String _targetID = '';
@@ -52,6 +56,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   bool _debugMode = false;
   bool _fallbackEnabled = false;
   bool _useDirectServer = false;
+  bool _sendViaAAAA = false;
   int _pollMin = 20;
   int _pollMax = 40;
   int _retryCount = 1;
@@ -62,17 +67,31 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
 
   static const Duration _bufferTtl = Duration(seconds: 90);
   static const int _historyMax = 200;
+  static const Color _accent = Color(0xFF00A884);
+  static const Color _accentAlt = Color(0xFF25D366);
+  static const Color _panel = Color(0xFF111B21);
+  static const Color _panelAlt = Color(0xFF0B141A);
+  static const Color _textDim = Color(0xFF8696A0);
 
   @override
   void initState() {
     super.initState();
     _setupAnimations();
     _loadSettings();
+    _chatScrollCtrl.addListener(_handleChatScroll);
   }
 
   void _setupAnimations() {
     _glowCtrl = AnimationController(vsync: this, duration: const Duration(seconds: 2))..repeat(reverse: true);
     _glowAnim = Tween<double>(begin: 0.3, end: 0.8).animate(CurvedAnimation(parent: _glowCtrl, curve: Curves.easeInOut));
+  }
+
+  void _handleChatScroll() {
+    if (!_chatScrollCtrl.hasClients) return;
+    final shouldShow = _chatScrollCtrl.offset > 120;
+    if (shouldShow != _showJumpToBottom) {
+      setState(() => _showJumpToBottom = shouldShow);
+    }
   }
 
   Future<void> _loadSettings() async {
@@ -105,15 +124,19 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       _debugMode = prefs.getBool('debug_mode') ?? false;
       _fallbackEnabled = prefs.getBool('fallback_enabled') ?? false;
       _useDirectServer = prefs.getBool('use_direct_server') ?? false;
+      _sendViaAAAA = prefs.getBool('send_via_aaaa') ?? false;
       _contactNames = names;
 
       if (prefs.getString('my_id') == null) prefs.setString('my_id', _myID);
     });
     await _loadHistory();
+    await _clearUnreadForTarget();
     _startPolling();
   }
 
   String _historyKey() => "chat_history_${_myID.toLowerCase()}_${_targetID.toLowerCase()}";
+
+  String _historyKeyForTarget(String targetId) => "chat_history_${_myID.toLowerCase()}_${targetId.toLowerCase()}";
 
   Future<void> _loadHistory() async {
     final prefs = await SharedPreferences.getInstance();
@@ -138,6 +161,65 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     final prefs = await SharedPreferences.getInstance();
     final data = _messages.take(_historyMax).toList();
     await prefs.setString(_historyKey(), jsonEncode(data));
+  }
+
+  Future<void> _appendToHistoryForTarget(String targetId, Map<String, dynamic> msg) async {
+    final prefs = await SharedPreferences.getInstance();
+    final key = _historyKeyForTarget(targetId);
+    final raw = prefs.getString(key);
+    List<Map<String, dynamic>> items = [];
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is List) {
+          items = decoded.whereType<Map>().map((m) => Map<String, dynamic>.from(m)).toList();
+        }
+      } catch (_) {
+        // ignore bad history
+      }
+    }
+    items.insert(0, msg);
+    final data = items.take(_historyMax).toList();
+    await prefs.setString(key, jsonEncode(data));
+  }
+
+  Future<void> _incrementUnread(String targetId) async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_unreadKey);
+    Map<String, int> counts = {};
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map) {
+          for (final entry in decoded.entries) {
+            final key = entry.key.toString().toLowerCase();
+            final val = int.tryParse(entry.value.toString()) ?? 0;
+            counts[key] = val;
+          }
+        }
+      } catch (_) {
+        // ignore bad counts
+      }
+    }
+    final key = targetId.toLowerCase();
+    counts[key] = (counts[key] ?? 0) + 1;
+    await prefs.setString(_unreadKey, jsonEncode(counts));
+  }
+
+  Future<void> _clearUnreadForTarget() async {
+    if (_targetID.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_unreadKey);
+    if (raw == null || raw.isEmpty) return;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map) {
+        decoded.remove(_targetID.toLowerCase());
+        await prefs.setString(_unreadKey, jsonEncode(decoded));
+      }
+    } catch (_) {
+      // ignore bad counts
+    }
   }
 
   // ───────────────────────── SEND ─────────────────────────
@@ -167,7 +249,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       for (int i = 0; i < chunks.length; i++) {
         final label = "${i + 1}-${chunks.length}-$mid-$_myID-$_targetID-${chunks[i]}";
         for (int r = 0; r <= _retryCount; r++) {
-          await transport.sendOnly("$label.$_baseDomain", qtype: 1);
+          await transport.sendOnly("$label.$_baseDomain", qtype: _sendViaAAAA ? 28 : 1);
         }
       }
       setState(() {
@@ -435,6 +517,16 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
           }
 
           if (!mounted) return;
+          if (sid != _targetID.toLowerCase()) {
+            await _appendToHistoryForTarget(sid, {
+              "text": decrypted,
+              "status": "received",
+              "from": sid,
+              "time": _getTime(),
+            });
+            await _incrementUnread(sid);
+            return;
+          }
           setState(() {
             _messages.insert(0, {
               "text": decrypted,
@@ -445,11 +537,13 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
           });
           _saveHistory();
 
-          // ACK2 (A)
+          // ACK2 (A + AAAA)
           final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
           final ackLabel = mid.isEmpty ? "ack2-$sid-$tot" : "ack2-$sid-$tot-$mid";
-          final ackNonce = IdUtils.generateRandomID();
-          await transport.sendOnly("$ackLabel.$ackNonce.$_baseDomain", qtype: 1);
+          final ackNonceA = IdUtils.generateRandomID();
+          final ackNonceAAAA = IdUtils.generateRandomID();
+          await transport.sendOnly("$ackLabel.$ackNonceA.$_baseDomain", qtype: 1);
+          await transport.sendOnly("$ackLabel.$ackNonceAAAA.$_baseDomain", qtype: 28);
         } catch (e) {
           if (_debugMode) print("❌ Decryption/Base32 Error: $e");
         }
@@ -466,6 +560,24 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     return _contactNames[key] ?? id;
   }
 
+  Future<void> _copyToClipboard(String text) async {
+    if (text.isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: text));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text("Copied to clipboard"), duration: Duration(milliseconds: 900)),
+    );
+  }
+
+  Future<void> _pasteFromClipboard() async {
+    final data = await Clipboard.getData('text/plain');
+    final clip = data?.text ?? '';
+    if (clip.isEmpty) return;
+    final current = _controller.text;
+    _controller.text = current + clip;
+    _controller.selection = TextSelection.collapsed(offset: _controller.text.length);
+  }
+
   Future<void> _clearHistory() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_historyKey());
@@ -479,14 +591,14 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       context: context,
       barrierDismissible: false,
       builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF182229),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16), side: BorderSide(color: const Color(0xFF00A884).withOpacity(0.3))),
-        title: const Text("CLEAR CHAT", style: TextStyle(fontSize: 12, letterSpacing: 2, fontWeight: FontWeight.bold, color: Color(0xFF00A884))),
-        content: const Text("This will remove local history for this chat.", style: TextStyle(color: Colors.white70, fontSize: 12)),
+        backgroundColor: const Color(0xFF111B21),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16), side: BorderSide(color: _accent.withOpacity(0.3))),
+        title: const Text("CLEAR CHAT", style: TextStyle(fontSize: 12, letterSpacing: 2, fontWeight: FontWeight.bold, color: _accent)),
+        content: const Text("This will remove local history for this chat.", style: TextStyle(color: _textDim, fontSize: 12)),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context), child: const Text("CANCEL", style: TextStyle(color: Colors.white30))),
           ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00A884), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
+            style: ElevatedButton.styleFrom(backgroundColor: _accent, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
             onPressed: () async {
               await _clearHistory();
               if (context.mounted) Navigator.pop(context);
@@ -503,16 +615,138 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   @override
   Widget build(BuildContext context) {
     final title = widget.displayName?.isNotEmpty == true ? widget.displayName! : _targetID;
+    final subtitle = widget.displayName?.isNotEmpty == true ? _targetID : "";
+    final initial = title.isNotEmpty ? title[0].toUpperCase() : "?";
     return Scaffold(
       appBar: AppBar(
-        title: Text("CHAT: $title", style: const TextStyle(letterSpacing: 2, fontSize: 12, fontWeight: FontWeight.bold)),
+        title: Row(
+          children: [
+            Container(
+              width: 28,
+              height: 28,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: const LinearGradient(colors: [_accent, _accentAlt]),
+                boxShadow: [
+                  BoxShadow(color: _accent.withOpacity(0.3), blurRadius: 8),
+                ],
+              ),
+              child: Center(
+                child: Text(initial, style: const TextStyle(color: Color(0xFF001018), fontSize: 12)),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(title, style: const TextStyle(letterSpacing: 1, fontSize: 12, fontWeight: FontWeight.bold)),
+                  if (subtitle.isNotEmpty)
+                    Text(subtitle, style: const TextStyle(color: _textDim, fontSize: 9)),
+                ],
+              ),
+            ),
+          ],
+        ),
+        flexibleSpace: Container(
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              colors: [Color(0xFF0B141A), Color(0xFF111B21)],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+            ),
+          ),
+        ),
         actions: [IconButton(icon: const Icon(Icons.settings, size: 20), onPressed: _showSettings)],
       ),
-      body: Column(
+      body: Stack(
         children: [
-          _buildStatusLine(),
-          Expanded(child: _buildChatList()),
-          _buildInputArea(),
+          Container(
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  Color(0xFF0B141A),
+                  Color(0xFF0E1A20),
+                  Color(0xFF111B21),
+                ],
+              ),
+            ),
+          ),
+          Positioned(
+            top: -60,
+            right: -40,
+            child: Container(
+              width: 160,
+              height: 160,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: _accent.withOpacity(0.06),
+              ),
+            ),
+          ),
+          Positioned(
+            bottom: -80,
+            left: -40,
+            child: Container(
+              width: 180,
+              height: 180,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: _accentAlt.withOpacity(0.05),
+              ),
+            ),
+          ),
+          Column(
+            children: [
+              _buildStatusLine(),
+              Expanded(child: _buildChatList()),
+              _buildInputArea(),
+            ],
+          ),
+          Positioned(
+            right: 16,
+            bottom: 96,
+            child: AnimatedOpacity(
+              opacity: _showJumpToBottom ? 1 : 0,
+              duration: const Duration(milliseconds: 160),
+              child: IgnorePointer(
+                ignoring: !_showJumpToBottom,
+                child: GestureDetector(
+                  onTap: () {
+                    if (_chatScrollCtrl.hasClients) {
+                      _chatScrollCtrl.animateTo(
+                        0,
+                        duration: const Duration(milliseconds: 220),
+                        curve: Curves.easeOut,
+                      );
+                    }
+                  },
+                  child: Container(
+                    width: 38,
+                    height: 38,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      gradient: const LinearGradient(
+                        colors: [_accent, _accentAlt],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: _accent.withOpacity(0.3),
+                          blurRadius: 12,
+                        ),
+                      ],
+                    ),
+                    child: const Icon(Icons.arrow_downward, size: 18, color: Color(0xFF001018)),
+                  ),
+                ),
+              ),
+            ),
+          ),
         ],
       ),
     );
@@ -521,23 +755,41 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   Widget _buildStatusLine() {
     return Container(
       width: double.infinity,
-      color: Colors.black,
-      padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 12),
-      child: Row(
-        children: [
-          Expanded(
-            child: Text("SYS_STATUS: ${_status.name.toUpperCase()} | NODE: $_myID",
-                style: const TextStyle(color: Color(0xFF00A884), fontSize: 9, fontFamily: 'monospace')),
-          ),
-          if (!_pollingEnabled)
-            IconButton(
-              icon: const Icon(Icons.sync, size: 14, color: Color(0xFF00A884)),
-              tooltip: "Manual Sync",
-              onPressed: _fetchBuffer,
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
+      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 12),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 10),
+        decoration: BoxDecoration(
+          color: const Color(0xFF111B21),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: const Color(0xFF202C33)),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 6,
+              height: 6,
+              decoration: BoxDecoration(
+                color: _status == NodeStatus.error ? Colors.redAccent : _accent,
+                shape: BoxShape.circle,
+              ),
             ),
-        ],
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                "SYS: ${_status.name.toUpperCase()} | NODE: $_myID",
+                style: const TextStyle(color: Color(0xFF00A884), fontSize: 9, letterSpacing: 1),
+              ),
+            ),
+            if (!_pollingEnabled)
+              IconButton(
+                icon: const Icon(Icons.sync, size: 16, color: _accent),
+                tooltip: "Manual Sync",
+                onPressed: _fetchBuffer,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -545,7 +797,8 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   Widget _buildChatList() {
     return ListView.builder(
       reverse: true,
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+      controller: _chatScrollCtrl,
       itemCount: _messages.length,
       itemBuilder: (context, index) => _buildMessageBubble(_messages[index]),
     );
@@ -553,37 +806,54 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
 
   Widget _buildMessageBubble(Map<String, dynamic> msg) {
     bool isRx = msg["status"] == "received";
+    final bubble = Container(
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: isRx ? const Color(0xFF202C33) : const Color(0xFF005C4B),
+        borderRadius: BorderRadius.circular(16).copyWith(
+          bottomLeft: isRx ? Radius.zero : const Radius.circular(16),
+          bottomRight: isRx ? const Radius.circular(16) : Radius.zero,
+        ),
+        border: Border.all(color: isRx ? const Color(0xFF1F2C34) : const Color(0xFF004C3F)),
+      ),
+      child: Column(
+        crossAxisAlignment: isRx ? CrossAxisAlignment.start : CrossAxisAlignment.end,
+        children: [
+          if (isRx)
+            Text(
+              _displayNameForId((msg["from"] ?? "").toString()),
+              style: const TextStyle(color: Color(0xFF00A884), fontSize: 8, fontWeight: FontWeight.bold, letterSpacing: 1),
+            ),
+          SelectableText(
+            msg["text"],
+            style: const TextStyle(color: Colors.white, fontSize: 13, height: 1.25),
+          ),
+          const SizedBox(height: 4),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(msg["time"], style: const TextStyle(color: _textDim, fontSize: 8)),
+              const SizedBox(width: 4),
+              if (msg["status"] != "received") _buildStatusIcon(msg["status"]),
+            ],
+          ),
+        ],
+      ),
+    );
+
     return Align(
       alignment: isRx ? Alignment.centerLeft : Alignment.centerRight,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 5),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: isRx ? const Color(0xFF1F2C34) : const Color(0xFF005C4B),
-          borderRadius: BorderRadius.circular(15).copyWith(
-            bottomLeft: isRx ? Radius.zero : const Radius.circular(15),
-            bottomRight: isRx ? const Radius.circular(15) : Radius.zero,
+      child: GestureDetector(
+        onLongPress: () => _copyToClipboard((msg["text"] ?? "").toString()),
+        child: TweenAnimationBuilder<double>(
+          tween: Tween<double>(begin: 0.0, end: 1.0),
+          duration: const Duration(milliseconds: 220),
+          builder: (context, value, child) => Opacity(
+            opacity: value,
+            child: Transform.translate(offset: Offset(0, (1 - value) * 6), child: child),
           ),
-        ),
-        child: Column(
-          crossAxisAlignment: isRx ? CrossAxisAlignment.start : CrossAxisAlignment.end,
-          children: [
-            if (isRx)
-              Text(
-                _displayNameForId((msg["from"] ?? "").toString()),
-                style: const TextStyle(color: Color(0xFF00A884), fontSize: 8, fontWeight: FontWeight.bold),
-              ),
-            Text(msg["text"], style: const TextStyle(color: Colors.white)),
-            const SizedBox(height: 4),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(msg["time"], style: const TextStyle(color: Colors.white30, fontSize: 8)),
-                const SizedBox(width: 4),
-                if (msg["status"] != "received") _buildStatusIcon(msg["status"]),
-              ],
-            ),
-          ],
+          child: bubble,
         ),
       ),
     );
@@ -592,11 +862,11 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   Widget _buildStatusIcon(String status) {
     switch (status) {
       case "sending":
-        return const Icon(Icons.check, size: 14, color: Colors.white24);
+        return const Icon(Icons.check, size: 14, color: Color(0xFF8696A0));
       case "sent":
-        return const Icon(Icons.check, size: 14, color: Colors.white54);
+        return const Icon(Icons.check, size: 14, color: Color(0xFF8696A0));
       case "delivered":
-        return const Icon(Icons.done_all, size: 14, color: Color(0xFF00A884));
+        return const Icon(Icons.done_all, size: 14, color: _accent);
       default:
         return const SizedBox.shrink();
     }
@@ -604,29 +874,50 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
 
   Widget _buildInputArea() {
     return Container(
-      padding: const EdgeInsets.fromLTRB(10, 10, 10, 30),
-      color: const Color(0xFF182229),
-      child: Row(
-        children: [
-          Expanded(
-            child: TextField(
-              controller: _controller,
-              style: const TextStyle(fontSize: 14),
-              decoration: InputDecoration(
-                hintText: _targetID.isEmpty ? "Set Target in Settings" : "Message to $_targetID...",
-                hintStyle: const TextStyle(color: Colors.white24),
-                filled: true,
-                fillColor: const Color(0xFF2A3942),
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(30), borderSide: BorderSide.none),
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 28),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        decoration: BoxDecoration(
+          color: const Color(0xFF111B21),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: const Color(0xFF202C33)),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: TextField(
+                controller: _controller,
+                style: const TextStyle(fontSize: 14, color: Colors.white),
+                decoration: InputDecoration(
+                  hintText: _targetID.isEmpty ? "Set Target in Settings" : "Message to $_targetID...",
+                  hintStyle: const TextStyle(color: _textDim),
+                  filled: true,
+                  fillColor: const Color(0xFF202C33),
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none),
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                ),
               ),
             ),
-          ),
-          const SizedBox(width: 8),
-          CircleAvatar(
-            backgroundColor: const Color(0xFF00A884),
-            child: IconButton(icon: const Icon(Icons.send, color: Colors.white), onPressed: _sendMessage),
-          ),
-        ],
+            const SizedBox(width: 8),
+            IconButton(
+              icon: const Icon(Icons.paste, color: Color(0xFF00A884), size: 18),
+              tooltip: "Paste",
+              onPressed: _pasteFromClipboard,
+            ),
+            Container(
+              width: 42,
+              height: 42,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: const Color(0xFF00A884),
+              ),
+              child: IconButton(
+                icon: const Icon(Icons.send, color: Colors.white, size: 20),
+                onPressed: _sendMessage,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -639,6 +930,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     final pollMinCtrl = TextEditingController(text: _pollMin.toString());
     final pollMaxCtrl = TextEditingController(text: _pollMax.toString());
     final retryCtrl = TextEditingController(text: _retryCount.toString());
+    bool advancedOpen = true;
 
     if (!mounted) return;
 
@@ -647,9 +939,9 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       barrierDismissible: false,
       builder: (context) => StatefulBuilder(
         builder: (context, setL) => AlertDialog(
-          backgroundColor: const Color(0xFF182229),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20), side: BorderSide(color: const Color(0xFF00A884).withOpacity(0.3))),
-          title: const Text("NODE CONFIGURATION", style: TextStyle(fontSize: 12, letterSpacing: 2, fontWeight: FontWeight.bold, color: Color(0xFF00A884))),
+          backgroundColor: const Color(0xFF111B21),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20), side: BorderSide(color: _accent.withOpacity(0.3))),
+          title: const Text("NODE CONFIGURATION", style: TextStyle(fontSize: 12, letterSpacing: 2, fontWeight: FontWeight.bold, color: _accent)),
           content: SingleChildScrollView(
             child: Column(
               mainAxisSize: MainAxisSize.min,
@@ -662,8 +954,8 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                     decoration: BoxDecoration(
                       color: Colors.black.withOpacity(0.4),
                       borderRadius: BorderRadius.circular(15),
-                      border: Border.all(color: const Color(0xFF00A884).withOpacity(_glowAnim.value)),
-                      boxShadow: [BoxShadow(color: const Color(0xFF00A884).withOpacity(_glowAnim.value * 0.3), blurRadius: 15, spreadRadius: 1)],
+                      border: Border.all(color: _accent.withOpacity(_glowAnim.value)),
+                      boxShadow: [BoxShadow(color: _accent.withOpacity(_glowAnim.value * 0.3), blurRadius: 15, spreadRadius: 1)],
                     ),
                     child: Column(
                       children: [
@@ -688,14 +980,14 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                   width: double.infinity,
                   padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
                   decoration: BoxDecoration(
-                    color: Colors.black26,
+                    color: const Color(0xFF111B21),
                     borderRadius: BorderRadius.circular(14),
-                    border: Border.all(color: Colors.white10),
+                    border: Border.all(color: const Color(0xFF202C33)),
                   ),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text("CONNECTION", style: TextStyle(fontSize: 10, letterSpacing: 2, color: Colors.white38)),
+                      const Text("CONNECTION", style: TextStyle(fontSize: 10, letterSpacing: 2, color: _textDim)),
                       const SizedBox(height: 6),
                       _buildSettingField(targetCtrl, "Target Node ID", Icons.person_pin, "abcde", enabled: false),
                       _buildSettingField(ipCtrl, "Relay Server IP", Icons.lan, "1.2.3.4", enabled: _useDirectServer),
@@ -704,7 +996,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                         contentPadding: EdgeInsets.zero,
                         title: const Text("Use Direct Server IP", style: TextStyle(fontSize: 12, color: Colors.white70)),
                         value: _useDirectServer,
-                        activeColor: const Color(0xFF00A884),
+                        activeColor: _accent,
                         onChanged: (v) => setL(() => _useDirectServer = v),
                       ),
                     ],
@@ -713,17 +1005,26 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                 const SizedBox(height: 10),
                 Container(
                   width: double.infinity,
-                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
                   decoration: BoxDecoration(
-                    color: Colors.black26,
+                    color: const Color(0xFF111B21),
                     borderRadius: BorderRadius.circular(14),
-                    border: Border.all(color: Colors.white10),
+                    border: Border.all(color: const Color(0xFF202C33)),
                   ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
+                  child: ExpansionTile(
+                    initiallyExpanded: advancedOpen,
+                    onExpansionChanged: (v) => setL(() => advancedOpen = v),
+                    iconColor: _accent,
+                    collapsedIconColor: _accent,
+                    title: const Text("ADVANCED", style: TextStyle(fontSize: 10, letterSpacing: 2, color: _textDim)),
+                    childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
                     children: [
-                      const Text("POLLING", style: TextStyle(fontSize: 10, letterSpacing: 2, color: Colors.white38)),
-                      const SizedBox(height: 6),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text("Send via AAAA", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                        value: _sendViaAAAA,
+                        activeColor: _accent,
+                        onChanged: (v) => setL(() => _sendViaAAAA = v),
+                      ),
                       Row(children: [
                         Expanded(child: _buildSettingField(pollMinCtrl, "Min Poll", Icons.timer_outlined, "20", isNum: true)),
                         const SizedBox(width: 10),
@@ -734,38 +1035,21 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                         contentPadding: EdgeInsets.zero,
                         title: const Text("Active Polling", style: TextStyle(fontSize: 12, color: Colors.white70)),
                         value: _pollingEnabled,
-                        activeColor: const Color(0xFF00A884),
+                        activeColor: _accent,
                         onChanged: (v) => setL(() => _pollingEnabled = v),
                       ),
                       SwitchListTile(
                         contentPadding: EdgeInsets.zero,
                         title: const Text("A Fallback on No Response", style: TextStyle(fontSize: 12, color: Colors.white70)),
                         value: _fallbackEnabled,
-                        activeColor: const Color(0xFF00A884),
+                        activeColor: _accent,
                         onChanged: (v) => setL(() => _fallbackEnabled = v),
                       ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 10),
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
-                  decoration: BoxDecoration(
-                    color: Colors.black26,
-                    borderRadius: BorderRadius.circular(14),
-                    border: Border.all(color: Colors.white10),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text("DEBUG", style: TextStyle(fontSize: 10, letterSpacing: 2, color: Colors.white38)),
-                      const SizedBox(height: 6),
                       SwitchListTile(
                         contentPadding: EdgeInsets.zero,
                         title: const Text("Debug Mode", style: TextStyle(fontSize: 12, color: Colors.white70)),
                         value: _debugMode,
-                        activeColor: Colors.orange,
+                        activeColor: _accentAlt,
                         onChanged: (v) => setL(() => _debugMode = v),
                       ),
                     ],
@@ -775,10 +1059,10 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
             ),
           ),
           actions: [
-            TextButton(onPressed: _confirmClearHistory, child: const Text("CLEAR CHAT", style: TextStyle(color: Colors.orange))),
+            TextButton(onPressed: _confirmClearHistory, child: const Text("CLEAR CHAT", style: TextStyle(color: _accentAlt))),
             TextButton(onPressed: () => Navigator.pop(context), child: const Text("DISCARD", style: TextStyle(color: Colors.white30))),
             ElevatedButton(
-              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00A884), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
+              style: ElevatedButton.styleFrom(backgroundColor: _accent, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
               onPressed: () async {
                 await prefs.setString('target_id', targetCtrl.text.trim());
                 await prefs.setString('server_ip', ipCtrl.text.trim());
@@ -790,6 +1074,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                 await prefs.setBool('debug_mode', _debugMode);
                 await prefs.setBool('fallback_enabled', _fallbackEnabled);
                 await prefs.setBool('use_direct_server', _useDirectServer);
+                await prefs.setBool('send_via_aaaa', _sendViaAAAA);
                 _loadSettings();
                 if (context.mounted) Navigator.pop(context);
               },
@@ -812,10 +1097,10 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
         decoration: InputDecoration(
           labelText: label,
           hintText: hint,
-          prefixIcon: Icon(icon, size: 18, color: const Color(0xFF00A884)),
-          labelStyle: const TextStyle(color: Colors.white54, fontSize: 12),
+          prefixIcon: Icon(icon, size: 18, color: _accent),
+          labelStyle: const TextStyle(color: _textDim, fontSize: 12),
           filled: true,
-          fillColor: Colors.black26,
+          fillColor: const Color(0xFF202C33),
           border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
         ),
       ),
@@ -827,6 +1112,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     _pollTimer?.cancel();
     _glowCtrl.dispose();
     _controller.dispose();
+    _chatScrollCtrl.dispose();
     super.dispose();
   }
 }

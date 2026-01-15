@@ -618,7 +618,7 @@ func retryAck2Stable(senderID string, total int, mid string) {
 
 	for i := 0; i < 3; i++ {
 		if DIRECT_SERVER_IP != "" {
-			sendDirectDNSQuery(domain, 1) // A query
+			sendDirectDNSQuery(domain, 28) // AAAA query
 		} else {
 			ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 			_, _ = resolver4.LookupIP(ctx, "ip4", domain)
@@ -688,7 +688,7 @@ func sendChunks(data string) {
 
 		if DIRECT_SERVER_IP != "" {
 			// Direct mode
-			sendDirectDNSQuery(host, 1) // A query
+			sendDirectDNSQuery(host, 28) // AAAA query
 		} else {
 			// Recursive mode
 			ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)

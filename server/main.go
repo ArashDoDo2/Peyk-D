@@ -32,6 +32,8 @@ const (
 	ENABLE_ACK2_LOG     = false
 	ENABLE_GC_LOG       = true
 	ACK2_TTL           = 24 * time.Hour
+	ENABLE_EVENT_LOG   = true
+	ENABLE_COLOR_LOG   = true
 )
 
 // DNS Types
@@ -64,6 +66,8 @@ var (
 	// payload: "ACK2-<sid>-<tot>"
 	deliveryAcks = make(map[string][]string)
 	ack2Seen     = make(map[string]time.Time)
+	msgFirstAt   = make(map[string]time.Time)
+	sendFirstAt  = make(map[string]time.Time)
 
 	storeMu sync.Mutex
 )
@@ -92,6 +96,17 @@ func logIf(enabled bool, format string, args ...interface{}) {
 	if enabled {
 		log.Printf(format, args...)
 	}
+}
+
+func logEvent(tag, color, format string, args ...interface{}) {
+	if !ENABLE_EVENT_LOG {
+		return
+	}
+	prefix := tag
+	if ENABLE_COLOR_LOG && color != "" {
+		prefix = color + tag + "\x1b[0m"
+	}
+	log.Printf(prefix+" "+format, args...)
 }
 
 // ───────────────────────── Main ─────────────────────────
@@ -202,14 +217,8 @@ func handlePacket(conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
 		return
 	}
 
-	// Inbound chunk or ACK2 (A)
-	prefix := strings.TrimSuffix(domain, "."+BASE_DOMAIN)
-	label := prefix
-	if dot := strings.IndexByte(prefix, '.'); dot >= 0 {
-		label = prefix[:dot]
-	}
-	ack2Label := strings.HasPrefix(label, "ack2-")
-	if q.QType != QTYPE_A && !(ack2Label && q.QType == QTYPE_AAAA) {
+	// Inbound chunk or ACK2 (A/AAAA)
+	if q.QType != QTYPE_A && q.QType != QTYPE_AAAA {
 		atomic.AddUint64(&statIgnored, 1)
 		return
 	}
@@ -259,9 +268,14 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 
 		atomic.AddUint64(&statRxAck2, 1)
 		if mid != "" {
-            logIf(ENABLE_ACK2_LOG, "ACK2 stored sid=%s tot=%d mid=%s (queue=%d) from=%s", sid, tot, mid, queueLen, addr.String())
+			logEvent("[ACK2-RX]", "\x1b[36m", "delivery confirmed sid=%s tot=%d mid=%s from=%s queue=%d", sid, tot, mid, addr.String(), queueLen)
 		} else {
-            logIf(ENABLE_ACK2_LOG, "ACK2 stored sid=%s tot=%d (queue=%d) from=%s", sid, tot, queueLen, addr.String())
+			logEvent("[ACK2-RX]", "\x1b[36m", "delivery confirmed sid=%s tot=%d from=%s queue=%d", sid, tot, addr.String(), queueLen)
+		}
+		if mid != "" {
+			logIf(ENABLE_ACK2_LOG, "ACK2 stored sid=%s tot=%d mid=%s (queue=%d) from=%s", sid, tot, mid, queueLen, addr.String())
+		} else {
+			logIf(ENABLE_ACK2_LOG, "ACK2 stored sid=%s tot=%d (queue=%d) from=%s", sid, tot, queueLen, addr.String())
 		}
 
 		// Keep ACK response as A with fixed ACK_IP (unchanged)
@@ -323,6 +337,11 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 		messageStore[rid] = make(map[string][]ChunkEnvelope)
 	}
 
+	keyFull := fmt.Sprintf("%s|%s", rid, key)
+	if _, ok := msgFirstAt[keyFull]; !ok {
+		msgFirstAt[keyFull] = time.Now()
+	}
+
 	for _, c := range messageStore[rid][key] {
 		if c.Idx == env.Idx {
 			dup = true
@@ -334,15 +353,27 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 		messageStore[rid][key] = append(messageStore[rid][key], env)
 		msgSize = len(messageStore[rid][key])
 	}
+
+	firstAt := msgFirstAt[keyFull]
+	if msgSize == tot && !firstAt.IsZero() {
+		delete(msgFirstAt, keyFull)
+	}
 	storeMu.Unlock()
 
 	if dup {
 		atomic.AddUint64(&statRxDupChunks, 1)
-        logIf(ENABLE_RX_CHUNK_LOG, "DUP chunk sid=%s->%s %d/%d from=%s", sid, rid, idx, tot, addr.String())
+		logIf(ENABLE_RX_CHUNK_LOG, "DUP chunk sid=%s->%s %d/%d from=%s", sid, rid, idx, tot, addr.String())
 	} else {
 		atomic.AddUint64(&statRxChunks, 1)
-        logIf(ENABLE_RX_CHUNK_LOG, "RX chunk sid=%s->%s %d/%d payloadLen=%d key=%s chunksInKey=%d preview=%q",
+		logIf(ENABLE_RX_CHUNK_LOG, "RX chunk sid=%s->%s %d/%d payloadLen=%d key=%s chunksInKey=%d preview=%q",
 			sid, rid, idx, tot, len(payload), key, msgSize, preview(payload))
+	}
+
+	if msgSize == tot {
+		if firstAt.IsZero() {
+			firstAt = time.Now()
+		}
+		logEvent("[MSG-RX]", "\x1b[32m", "complete sid=%s -> rid=%s parts=%d took=%s", sid, rid, tot, time.Since(firstAt))
 	}
 
 	// ACK for inbound chunk remains A
@@ -372,7 +403,8 @@ func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain str
 		}
 		storeMu.Unlock()
 
-        logIf(ENABLE_POLL_LOG, "poll rid=%s from=%s -> ACK2 (%s) remaining=%d viaQ=%d", rid, addr.String(), ack, remaining, qtype)
+		logIf(ENABLE_POLL_LOG, "poll rid=%s from=%s -> ACK2 (%s) remaining=%d viaQ=%d", rid, addr.String(), ack, remaining, qtype)
+		logEvent("[ACK2-TX]", "\x1b[35m", "sent to rid=%s ack=%s remaining=%d viaQ=%d", rid, ack, remaining, qtype)
 		sendPollingPayload(conn, addr, txID, domain, ack, qtype, qclass)
 		return
 	}
@@ -411,10 +443,22 @@ func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain str
 			msgs[key] = chunks[1:]
 		}
 		leftInKey := len(msgs[key])
+		keyFull := fmt.Sprintf("%s|%s", rid, key)
+		if _, ok := sendFirstAt[keyFull]; !ok {
+			sendFirstAt[keyFull] = time.Now()
+		}
+		var firstAt time.Time
+		if leftInKey == 0 {
+			firstAt = sendFirstAt[keyFull]
+			delete(sendFirstAt, keyFull)
+		}
 		storeMu.Unlock()
 
-        logIf(ENABLE_POLL_LOG, "poll rid=%s from=%s -> CHUNK key=%s sent=%d/%d sid=%s payloadLen=%d leftInKey=%d viaQ=%d preview=%q",
+		logIf(ENABLE_POLL_LOG, "poll rid=%s from=%s -> CHUNK key=%s sent=%d/%d sid=%s payloadLen=%d leftInKey=%d viaQ=%d preview=%q",
 			rid, addr.String(), key, c.Idx, c.Tot, c.SID, len(c.Payload), leftInKey, qtype, preview(full))
+		if leftInKey == 0 && !firstAt.IsZero() {
+			logEvent("[MSG-TX]", "\x1b[33m", "served sid=%s -> rid=%s parts=%d took=%s", c.SID, rid, c.Tot, time.Since(firstAt))
+		}
 
 		sendPollingPayload(conn, addr, txID, domain, full, qtype, qclass)
 		return
@@ -477,6 +521,16 @@ func garbageCollector() {
 			if len(msgs) == 0 {
 				delete(messageStore, rid)
 				ridsRemoved++
+			}
+		}
+		for key, ts := range msgFirstAt {
+			if now.Sub(ts) > MESSAGE_TTL {
+				delete(msgFirstAt, key)
+			}
+		}
+		for key, ts := range sendFirstAt {
+			if now.Sub(ts) > MESSAGE_TTL {
+				delete(sendFirstAt, key)
 			}
 		}
 		storeMu.Unlock()
