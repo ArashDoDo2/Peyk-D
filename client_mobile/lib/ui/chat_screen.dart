@@ -161,6 +161,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
             ..clear()
             ..addAll(items);
         });
+        _rebuildPendingDelivery();
       }
     } catch (_) {
       // ignore bad history
@@ -445,15 +446,23 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     final tot = parts[2];
     final mid = parts.length == 4 ? parts[3].toLowerCase() : "";
     final key = mid.isEmpty ? "$sid:$tot" : "$sid:$tot:$mid";
-    if (_pendingDelivery.containsKey(key)) {
-      for (int i = 0; i < _messages.length; i++) {
-        if (_messages[i]["deliveryKey"] == key) {
-          setState(() => _messages[i]["status"] = "delivered");
-          _saveHistory();
-          break;
-        }
+    for (int i = 0; i < _messages.length; i++) {
+      if (_messages[i]["deliveryKey"] == key) {
+        setState(() => _messages[i]["status"] = "delivered");
+        _saveHistory();
+        break;
       }
-      _pendingDelivery.remove(key);
+    }
+    _pendingDelivery.remove(key);
+  }
+
+  void _rebuildPendingDelivery() {
+    _pendingDelivery.clear();
+    for (final msg in _messages) {
+      if (msg["status"] == "sent" && msg["deliveryKey"] != null) {
+        final key = msg["deliveryKey"].toString();
+        _pendingDelivery[key] = 1;
+      }
     }
   }
 
@@ -1199,14 +1208,21 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                 await prefs.setString('target_id', targetCtrl.text.trim());
                 await prefs.setString('server_ip', ipCtrl.text.trim());
                 await prefs.setString('base_domain', domainCtrl.text.trim());
-                await prefs.setInt('poll_min', int.tryParse(pollMinCtrl.text) ?? 20);
-                await prefs.setInt('poll_max', int.tryParse(pollMaxCtrl.text) ?? 40);
+                final nextPollMin = int.tryParse(pollMinCtrl.text) ?? 20;
+                final nextPollMax = int.tryParse(pollMaxCtrl.text) ?? 40;
+                await prefs.setInt('poll_min', nextPollMin);
+                await prefs.setInt('poll_max', nextPollMax);
                 await prefs.setInt('retry_count', int.tryParse(retryCtrl.text) ?? 1);
                 await prefs.setBool('polling_enabled', _pollingEnabled);
                 await prefs.setBool('debug_mode', _debugMode);
                 await prefs.setBool('fallback_enabled', _fallbackEnabled);
                 await prefs.setBool('use_direct_server', _useDirectServer);
                 await prefs.setBool('send_via_aaaa', _sendViaAAAA);
+                setState(() {
+                  _pollMin = nextPollMin;
+                  _pollMax = nextPollMax;
+                });
+                _startPolling();
                 _loadSettings();
                 if (context.mounted) Navigator.pop(context);
               },
