@@ -40,6 +40,7 @@ class RxAssembly {
   }
 
   bool get isComplete => _parts.length == total;
+  int get receivedCount => _parts.length;
 
   String assemble() {
     final sb = StringBuffer();

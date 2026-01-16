@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"strings"
 	"sync"
@@ -21,22 +22,23 @@ const (
 
 // Debug knobs
 const (
-	DEBUG_STATS_EVERY = 10 * time.Second
-	GC_EVERY          = 20 * time.Second
-	MESSAGE_TTL       = 24 * time.Hour
-	PAYLOAD_PREVIEW   = 24 // chars
-	ENABLE_STATS_LOG  = false
-	ENABLE_VERBOSE_LOG = false
-	ENABLE_POLL_LOG    = true
-	ENABLE_RX_CHUNK_LOG = false
-	ENABLE_ACK2_LOG     = false
-	ENABLE_GC_LOG       = true
-	ACK2_TTL           = 24 * time.Hour
-	ENABLE_EVENT_LOG   = true
-	ENABLE_COLOR_LOG   = true
-	RESEND_BACKOFF_START = 6
-	RESEND_BACKOFF_MAX  = 30 * time.Second
-	LEGACY_RESEND_CAP   = 60
+	DEBUG_STATS_EVERY    = 10 * time.Second
+	GC_EVERY             = 20 * time.Second
+	MESSAGE_TTL          = 24 * time.Hour
+	PAYLOAD_PREVIEW      = 24 // chars
+	ENABLE_STATS_LOG     = false
+	ENABLE_VERBOSE_LOG   = false
+	ENABLE_POLL_LOG      = true
+	ENABLE_RX_CHUNK_LOG  = false
+	ENABLE_ACK2_LOG      = false
+	ENABLE_GC_LOG        = true
+	ENABLE_CLEANUP_LOG   = false
+	ACK2_TTL             = 24 * time.Hour
+	ENABLE_EVENT_LOG     = true
+	ENABLE_COLOR_LOG     = true
+	RESEND_BACKOFF_START = 16
+	RESEND_BACKOFF_MAX   = 1 * time.Second
+	RESEND_BACKOFF_MIN   = 100 * time.Millisecond
 )
 
 // DNS Types
@@ -66,12 +68,12 @@ type sendState struct {
 
 // messageStore:
 // map[receiverID]map[messageKey][]ChunkEnvelope
-// messageKey = sid + ":" + tot
+// messageKey = sid + ":" + mid + ":" + tot
 var (
 	messageStore = make(map[string]map[string][]ChunkEnvelope)
 
 	// deliveryAcks: map[senderID][]string
-	// payload: "ACK2-<sid>-<tot>"
+	// payload: "ACK2-<sid>-<tot>-<mid>"
 	deliveryAcks = make(map[string][]string)
 	ack2Seen     = make(map[string]time.Time)
 	msgFirstAt   = make(map[string]time.Time)
@@ -81,6 +83,93 @@ var (
 
 	storeMu sync.Mutex
 )
+
+// purgeMessageLocked removes all traces of a message for a receiver.
+// storeMu must be held by the caller.
+func purgeMessageLocked(rid, msgKey string) {
+	keyFull := fmt.Sprintf("%s|%s", rid, msgKey)
+	existedCursor := false
+	existedMsgFirst := false
+	existedSendFirst := false
+	existedState := false
+	if _, ok := sendCursor[keyFull]; ok {
+		existedCursor = true
+	}
+	if _, ok := msgFirstAt[keyFull]; ok {
+		existedMsgFirst = true
+	}
+	if _, ok := sendFirstAt[keyFull]; ok {
+		existedSendFirst = true
+	}
+	if _, ok := sendStates[keyFull]; ok {
+		existedState = true
+	}
+	log.Printf("DEBUG-CLEANUP: rid=%s, msgKey=%s, keyFull=%s", rid, msgKey, keyFull)
+	logIf(ENABLE_CLEANUP_LOG, "cleanup rid=%s key=%s keyFull=%s", rid, msgKey, keyFull)
+	if msgs, ok := messageStore[rid]; ok {
+		before := len(msgs[msgKey])
+		delete(msgs, msgKey)
+		logIf(ENABLE_CLEANUP_LOG, "cleanup store rid=%s key=%s removedChunks=%d remainingKeys=%d", rid, msgKey, before, len(msgs))
+		if len(msgs) == 0 {
+			delete(messageStore, rid)
+			logIf(ENABLE_CLEANUP_LOG, "cleanup store rid=%s removed rid map", rid)
+		}
+	}
+	delete(sendCursor, keyFull)
+	delete(msgFirstAt, keyFull)
+	delete(sendFirstAt, keyFull)
+	delete(sendStates, keyFull)
+	logIf(ENABLE_CLEANUP_LOG, "cleanup state rid=%s key=%s cursor=%t msgFirst=%t sendFirst=%t state=%t",
+		rid, msgKey, existedCursor, existedMsgFirst, existedSendFirst, existedState)
+}
+
+// purgeMessageByKeyLocked removes all traces of a message across any receiver.
+// storeMu must be held by the caller.
+func purgeMessageByKeyLocked(msgKey string) {
+	rids := make(map[string]struct{})
+	for rid, msgs := range messageStore {
+		if _, ok := msgs[msgKey]; ok {
+			rids[rid] = struct{}{}
+		}
+	}
+	suffix := "|" + msgKey
+	for keyFull := range sendCursor {
+		if strings.HasSuffix(keyFull, suffix) {
+			rid := strings.TrimSuffix(keyFull, suffix)
+			if rid != "" {
+				rids[rid] = struct{}{}
+			}
+		}
+	}
+	for keyFull := range msgFirstAt {
+		if strings.HasSuffix(keyFull, suffix) {
+			rid := strings.TrimSuffix(keyFull, suffix)
+			if rid != "" {
+				rids[rid] = struct{}{}
+			}
+		}
+	}
+	for keyFull := range sendFirstAt {
+		if strings.HasSuffix(keyFull, suffix) {
+			rid := strings.TrimSuffix(keyFull, suffix)
+			if rid != "" {
+				rids[rid] = struct{}{}
+			}
+		}
+	}
+	for keyFull := range sendStates {
+		if strings.HasSuffix(keyFull, suffix) {
+			rid := strings.TrimSuffix(keyFull, suffix)
+			if rid != "" {
+				rids[rid] = struct{}{}
+			}
+		}
+	}
+	logIf(ENABLE_CLEANUP_LOG, "cleanup key=%s matchedRids=%d", msgKey, len(rids))
+	for rid := range rids {
+		purgeMessageLocked(rid, msgKey)
+	}
+}
 
 // ───────────────────────── Stats ─────────────────────────
 
@@ -123,6 +212,7 @@ func logEvent(tag, color, format string, args ...interface{}) {
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	rand.Seed(time.Now().UnixNano())
 
 	addr := net.UDPAddr{Port: LISTEN_PORT, IP: net.ParseIP(LISTEN_IP)}
 	conn, err := net.ListenUDP("udp", &addr)
@@ -134,7 +224,7 @@ func main() {
 	go garbageCollector()
 	go statsLogger()
 
-    log.Printf("PEYK-D server listening on %s:%d (udp)", LISTEN_IP, LISTEN_PORT)
+	log.Printf("PEYK-D server listening on %s:%d (udp)", LISTEN_IP, LISTEN_PORT)
 
 	buf := make([]byte, 512)
 	for {
@@ -223,7 +313,7 @@ func handlePacket(conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
 		}
 		atomic.AddUint64(&statPollRequests, 1)
 		handlePolling(conn, addr, txID, domain, q.QType, q.QClass)
-    logIf(ENABLE_VERBOSE_LOG, "done poll from=%s txid=%s took=%s", addr.String(), txIDHex, time.Since(start))
+		logIf(ENABLE_VERBOSE_LOG, "done poll from=%s txid=%s took=%s", addr.String(), txIDHex, time.Since(start))
 		return
 	}
 
@@ -245,26 +335,21 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 		label = prefix[:dot]
 	}
 
-	// ACK2: ack2-sid-tot or ack2-sid-tot-mid
+	// ACK2: ack2-sid-tot-mid (mid required)
 	if strings.HasPrefix(label, "ack2-") {
 		parts := strings.Split(label, "-")
-		if len(parts) < 3 || len(parts) > 4 {
+		if len(parts) != 4 {
 			return
 		}
 		sid := strings.ToLower(parts[1])
 		tot := atoiSafe(parts[2])
-		mid := ""
-		if len(parts) == 4 {
-			mid = strings.ToLower(parts[3])
-		}
+		mid := strings.ToLower(parts[3])
 		if tot <= 0 {
 			return
 		}
+		log.Printf("DEBUG-ACK2-IN: sid=%s, mid=%s, tot=%d", sid, mid, tot)
 
-		ack := fmt.Sprintf("ACK2-%s-%d", sid, tot)
-		if mid != "" {
-			ack = fmt.Sprintf("ACK2-%s-%d-%s", sid, tot, mid)
-		}
+		ack := fmt.Sprintf("ACK2-%s-%d-%s", sid, tot, mid)
 
 		storeMu.Lock()
 		ackKey := fmt.Sprintf("%s:%d:%s", sid, tot, mid)
@@ -276,77 +361,50 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 		queueLen := len(deliveryAcks[sid])
 
 		// Drop stored chunks for this message (stop resends after ACK2).
-		msgKey := ""
-		if mid != "" {
-			msgKey = fmt.Sprintf("%s:%s:%d", sid, mid, tot)
-		} else {
-			msgKey = fmt.Sprintf("%s:%d", sid, tot)
-		}
-		ridMatches := make([]string, 0, 2)
+		msgKey := fmt.Sprintf("%s:%s:%d", sid, mid, tot)
+		ridMatches := make(map[string]struct{})
 		for rid, msgs := range messageStore {
 			if _, ok := msgs[msgKey]; ok {
-				ridMatches = append(ridMatches, rid)
+				ridMatches[rid] = struct{}{}
 			}
 		}
-		if mid != "" || len(ridMatches) == 1 {
-			for _, rid := range ridMatches {
-				msgs := messageStore[rid]
-				delete(msgs, msgKey)
-				delete(sendCursor, fmt.Sprintf("%s|%s", rid, msgKey))
-				delete(msgFirstAt, fmt.Sprintf("%s|%s", rid, msgKey))
-				delete(sendStates, fmt.Sprintf("%s|%s", rid, msgKey))
+		logIf(ENABLE_CLEANUP_LOG, "ack2 cleanup sid=%s mid=%s tot=%d ridMatches=%d", sid, mid, tot, len(ridMatches))
+		if len(ridMatches) == 0 {
+			purgeMessageByKeyLocked(msgKey)
+		} else {
+			for rid := range ridMatches {
 				if start, okStart := sendFirstAt[fmt.Sprintf("%s|%s", rid, msgKey)]; okStart {
 					delete(sendFirstAt, fmt.Sprintf("%s|%s", rid, msgKey))
 					logEvent("[MSG-TX]", "\x1b[33m", "ack received sid=%s -> rid=%s parts=%d took=%s", sid, rid, tot, time.Since(start))
 				}
-				if len(msgs) == 0 {
-					delete(messageStore, rid)
-				}
+				purgeMessageLocked(rid, msgKey)
 			}
-		} else {
-			logIf(ENABLE_ACK2_LOG, "ACK2 cleanup skipped for sid=%s tot=%d (ambiguous rid, mid missing)", sid, tot)
 		}
 		storeMu.Unlock()
 
 		atomic.AddUint64(&statRxAck2, 1)
-		if mid != "" {
-			logEvent("[ACK2-RX]", "\x1b[36m", "delivery confirmed sid=%s tot=%d mid=%s from=%s queue=%d", sid, tot, mid, addr.String(), queueLen)
-		} else {
-			logEvent("[ACK2-RX]", "\x1b[36m", "delivery confirmed sid=%s tot=%d from=%s queue=%d", sid, tot, addr.String(), queueLen)
-		}
-		if mid != "" {
-			logIf(ENABLE_ACK2_LOG, "ACK2 stored sid=%s tot=%d mid=%s (queue=%d) from=%s", sid, tot, mid, queueLen, addr.String())
-		} else {
-			logIf(ENABLE_ACK2_LOG, "ACK2 stored sid=%s tot=%d (queue=%d) from=%s", sid, tot, queueLen, addr.String())
-		}
+		logEvent("[ACK2-RX]", "\x1b[36m", "delivery confirmed sid=%s tot=%d mid=%s from=%s queue=%d", sid, tot, mid, addr.String(), queueLen)
+		logIf(ENABLE_ACK2_LOG, "ACK2 stored sid=%s tot=%d mid=%s (queue=%d) from=%s", sid, tot, mid, queueLen, addr.String())
 
 		// Keep ACK response as A with fixed ACK_IP (unchanged)
 		sendAResponse(conn, addr, txID, domain, ACK_IP, qtype, qclass)
 		return
 	}
-	// Chunk: idx-tot-sid-rid-payload (legacy) or idx-tot-mid-sid-rid-payload
+	// Chunk: idx-tot-mid-sid-rid-payload (mid required)
 	labels := strings.Split(label, "-")
-	if len(labels) < 5 {
+	if len(labels) < 6 {
 		return
 	}
 
 	idx := atoiSafe(labels[0])
 	tot := atoiSafe(labels[1])
-	mid := ""
-	sid := ""
-	rid := ""
-	payload := ""
-
-	if len(labels) >= 6 && isBase32ID(labels[2]) && isBase32ID(labels[3]) && isBase32ID(labels[4]) {
-		mid = strings.ToLower(labels[2])
-		sid = strings.ToLower(labels[3])
-		rid = strings.ToLower(labels[4])
-		payload = strings.Join(labels[5:], "-")
-	} else {
-		sid = strings.ToLower(labels[2])
-		rid = strings.ToLower(labels[3])
-		payload = strings.Join(labels[4:], "-")
+	if !isBase32ID(labels[2]) || !isBase32ID(labels[3]) || !isBase32ID(labels[4]) {
+		return
 	}
+	mid := strings.ToLower(labels[2])
+	sid := strings.ToLower(labels[3])
+	rid := strings.ToLower(labels[4])
+	payload := strings.Join(labels[5:], "-")
 
 	if idx <= 0 || tot <= 0 || idx > tot || payload == "" {
 		return
@@ -362,12 +420,8 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 		AddedAt: time.Now(),
 	}
 
-	key := ""
-	if mid != "" {
-		key = fmt.Sprintf("%s:%s:%d", sid, mid, tot)
-	} else {
-		key = fmt.Sprintf("%s:%d", sid, tot)
-	}
+	key := fmt.Sprintf("%s:%s:%d", sid, mid, tot)
+	ackKey := fmt.Sprintf("%s:%d:%s", sid, tot, mid)
 
 	var (
 		dup     bool
@@ -375,6 +429,12 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 	)
 
 	storeMu.Lock()
+	if lastSeen, seen := ack2Seen[ackKey]; seen && time.Since(lastSeen) <= ACK2_TTL {
+		storeMu.Unlock()
+		atomic.AddUint64(&statIgnored, 1)
+		logIf(ENABLE_ACK2_LOG, "drop chunk for acked message sid=%s tot=%d mid=%s from=%s", sid, tot, mid, addr.String())
+		return
+	}
 	if messageStore[rid] == nil {
 		messageStore[rid] = make(map[string][]ChunkEnvelope)
 	}
@@ -427,7 +487,7 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain string, qtype, qclass uint16) {
 	parts := strings.Split(domain, ".")
 	if len(parts) < 3 {
-        logIf(ENABLE_VERBOSE_LOG, "poll malformed qname=%s from=%s -> NOP", domain, addr.String())
+		logIf(ENABLE_VERBOSE_LOG, "poll malformed qname=%s from=%s -> NOP", domain, addr.String())
 		sendPollingPayload(conn, addr, txID, domain, "NOP", qtype, qclass)
 		return
 	}
@@ -463,25 +523,26 @@ func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain str
 	now := time.Now()
 	for key, chunks := range msgs {
 		keyFull := fmt.Sprintf("%s|%s", rid, key)
+		keyParts := strings.Split(key, ":")
+		if len(keyParts) == 3 {
+			sid := keyParts[0]
+			mid := keyParts[1]
+			tot := atoiSafe(keyParts[2])
+			if tot > 0 {
+				ackKey := fmt.Sprintf("%s:%d:%s", sid, tot, mid)
+				if lastSeen, seen := ack2Seen[ackKey]; seen && time.Since(lastSeen) <= ACK2_TTL {
+					logIf(ENABLE_CLEANUP_LOG, "poll cleanup rid=%s key=%s ackKey=%s", rid, key, ackKey)
+					purgeMessageLocked(rid, key)
+					continue
+				}
+			}
+		}
 		state := sendStates[keyFull]
 		if !state.LastSent.IsZero() {
 			backoff := resendBackoff(state.Count)
 			if backoff > 0 && now.Sub(state.LastSent) < backoff {
 				continue
 			}
-		}
-
-		if chunks[0].MID == "" && state.Count >= LEGACY_RESEND_CAP {
-			logIf(ENABLE_POLL_LOG, "poll rid=%s from=%s -> DROP legacy key=%s after=%d sends", rid, addr.String(), key, state.Count)
-			delete(msgs, key)
-			delete(sendCursor, keyFull)
-			delete(msgFirstAt, keyFull)
-			delete(sendFirstAt, keyFull)
-			delete(sendStates, keyFull)
-			if len(msgs) == 0 {
-				delete(messageStore, rid)
-			}
-			continue
 		}
 
 		nextIdx := sendCursor[keyFull]
@@ -516,12 +577,7 @@ func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain str
 			sendCursor[keyFull] = 1
 		}
 
-		full := ""
-		if c.MID != "" {
-			full = fmt.Sprintf("%d-%d-%s-%s-%s-%s", c.Idx, c.Tot, c.MID, c.SID, c.RID, c.Payload)
-		} else {
-			full = fmt.Sprintf("%d-%d-%s-%s-%s", c.Idx, c.Tot, c.SID, c.RID, c.Payload)
-		}
+		full := fmt.Sprintf("%d-%d-%s-%s-%s-%s", c.Idx, c.Tot, c.MID, c.SID, c.RID, c.Payload)
 
 		// NOTE: We no longer have TXT 255 limitation; keep a sane cap anyway to avoid huge DNS responses.
 		// 480 bytes cap keeps us safe under typical 512-byte UDP DNS while still useful.
@@ -541,11 +597,15 @@ func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain str
 		logIf(ENABLE_POLL_LOG, "poll rid=%s from=%s -> CHUNK key=%s sent=%d/%d sid=%s payloadLen=%d leftInKey=%d viaQ=%d preview=%q",
 			rid, addr.String(), key, c.Idx, c.Tot, c.SID, len(c.Payload), leftInKey, qtype, preview(full))
 
+		log.Printf("DEBUG-POLL-SEND: rid=%s, msgKey=%s, keyFull=%s", rid, key, keyFull)
 		sendPollingPayload(conn, addr, txID, domain, full, qtype, qclass)
 		return
 	}
 
 	// should not reach
+	if len(msgs) == 0 {
+		delete(messageStore, rid)
+	}
 	storeMu.Unlock()
 	sendPollingPayload(conn, addr, txID, domain, "NOP", qtype, qclass)
 }
@@ -571,9 +631,13 @@ func resendBackoff(count int) time.Duration {
 	}
 	delay := time.Duration(1<<step) * time.Second
 	if delay > RESEND_BACKOFF_MAX {
-		return RESEND_BACKOFF_MAX
+		delay = RESEND_BACKOFF_MAX
 	}
-	return delay
+	if delay < RESEND_BACKOFF_MIN {
+		delay = RESEND_BACKOFF_MIN
+	}
+	jitterNanos := rand.Int63n(delay.Nanoseconds() - RESEND_BACKOFF_MIN.Nanoseconds() + 1)
+	return RESEND_BACKOFF_MIN + time.Duration(jitterNanos)
 }
 
 // ───────────────────────── GC ─────────────────────────

@@ -43,11 +43,11 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   final List<Map<String, dynamic>> _messages = [];
   final Map<String, _RxBufferState> _buffers = {};
   final Map<String, int> _pendingDelivery = {};
+  final Map<String, DateTime> _pendingLastSent = {};
   final Map<String, DateTime> _recentRx = {};
   Map<String, String> _contactNames = {};
   final ScrollController _chatScrollCtrl = ScrollController();
   bool _showJumpToBottom = false;
-  bool _inputRtl = false;
   static const String _unreadKey = 'contacts_unread';
 
   String _myID = '';
@@ -64,6 +64,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   int _pollMin = 20;
   int _pollMax = 40;
   int _retryCount = 1;
+  String _debugInfo = "";
 
   Timer? _pollTimer;
   late AnimationController _glowCtrl;
@@ -72,11 +73,15 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   static const Duration _bufferTtl = Duration(seconds: 90);
   static const int _historyMax = 200;
   static const Duration _rxDedupTtl = Duration(minutes: 10);
+  static const Duration _resendMinInterval = Duration(seconds: 20);
+  static const Duration _resendMaxInterval = Duration(minutes: 5);
+  static const Duration _sendChunkDelay = Duration(milliseconds: 50);
   static const Color _accent = Color(0xFF00A884);
   static const Color _accentAlt = Color(0xFF25D366);
   static const Color _panel = Color(0xFF111B21);
   static const Color _panelAlt = Color(0xFF0B141A);
   static const Color _textDim = Color(0xFF8696A0);
+  static const int _maxMessageChars = 280;
 
   @override
   void initState() {
@@ -94,6 +99,27 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   void _setupAnimations() {
     _glowCtrl = AnimationController(vsync: this, duration: const Duration(seconds: 2))..repeat(reverse: true);
     _glowAnim = Tween<double>(begin: 0.3, end: 0.8).animate(CurvedAnimation(parent: _glowCtrl, curve: Curves.easeInOut));
+  }
+
+  void _setDebugInfo(String info) {
+    if (!_debugMode) return;
+    setState(() => _debugInfo = info);
+  }
+
+  int? _currentRxPercent() {
+    if (_buffers.isEmpty) return null;
+    _RxBufferState? latest;
+    for (final st in _buffers.values) {
+      if (latest == null || st.lastUpdatedAt.isAfter(latest.lastUpdatedAt)) {
+        latest = st;
+      }
+    }
+    if (latest == null) return null;
+    final total = latest.asm.total;
+    if (total <= 0) return null;
+    final received = latest.asm.receivedCount;
+    final pct = ((received * 100) / total).floor();
+    return pct.clamp(0, 100);
   }
 
   void _handleChatScroll() {
@@ -247,28 +273,39 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     await _saveHistory();
 
     try {
+      _setDebugInfo("TX: encrypting...");
       final encrypted = await PeykCrypto.encrypt(text);
       final b32 = base32.encode(encrypted).toLowerCase().replaceAll('=', '');
       final chunks = _makeChunks(b32);
+      _setDebugInfo("TX: sending ${chunks.length} chunks");
       final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
       final mid = IdUtils.generateRandomID();
 
       final ackKey = "${_myID.toLowerCase()}:${chunks.length}:$mid";
+      _messages[0]["mid"] = mid;
+      _messages[0]["chunks"] = chunks;
+      _messages[0]["to"] = _targetID;
       _messages[0]["deliveryKey"] = ackKey;
       _pendingDelivery[ackKey] = 1;
+      _pendingLastSent[ackKey] = DateTime.now();
 
       for (int i = 0; i < chunks.length; i++) {
         final label = "${i + 1}-${chunks.length}-$mid-$_myID-$_targetID-${chunks[i]}";
+        if (chunks.length > 6) {
+          await Future.delayed(_sendChunkDelay);
+        }
         for (int r = 0; r <= _retryCount; r++) {
           await transport.sendOnly("$label.$_baseDomain", qtype: _sendViaAAAA ? 28 : 1);
         }
       }
+      _setDebugInfo("TX: sent ${chunks.length}/${chunks.length}");
       setState(() {
         _messages[0]["status"] = "sent";
         _status = NodeStatus.success;
       });
       await _saveHistory();
     } catch (e) {
+      _setDebugInfo("TX: error");
       setState(() => _status = NodeStatus.error);
     }
     Future.delayed(const Duration(seconds: 2), () => setState(() => _status = NodeStatus.idle));
@@ -317,6 +354,10 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   Future<void> _fetchBuffer() async {
     if (_status != NodeStatus.idle && _status != NodeStatus.polling) return;
     setState(() => _status = NodeStatus.polling);
+    if (_debugMode) {
+      final pct = _currentRxPercent();
+      _setDebugInfo(pct == null ? "RX: polling..." : "RX: polling ${pct}%");
+    }
     _gcBuffers();
 
     final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
@@ -325,16 +366,27 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     const int burstMinMs = 200;
     const int burstMaxMs = 400;
     const int maxLoops = 6;
+    const int burstMaxLoops = 60;
     const Duration maxBudget = Duration(seconds: 3);
+    const Duration burstBudget = Duration(seconds: 20);
     final startAt = DateTime.now();
+    var lastProgressAt = startAt;
     int loops = 0;
+    bool burstMode = false;
 
     while (hasMore) {
       if (!_pollingEnabled) break;
-      if (loops >= maxLoops || DateTime.now().difference(startAt) > maxBudget) {
+      final loopLimit = burstMode ? burstMaxLoops : maxLoops;
+      final budgetLimit = burstMode ? burstBudget : maxBudget;
+      final budgetStart = burstMode ? lastProgressAt : startAt;
+    if (loops >= loopLimit || DateTime.now().difference(budgetStart) > budgetLimit) {
         break;
       }
       loops++;
+      if (_debugMode) {
+        final pct = _currentRxPercent();
+        _setDebugInfo(pct == null ? "RX: polling..." : "RX: polling ${pct}%");
+      }
 
       Uint8List? rawBytes;
       String txt = "";
@@ -426,11 +478,22 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       } else {
         _handleIncomingChunk(txt);
       }
+      if (!burstMode && looksFrame) {
+        burstMode = true;
+      }
+      lastProgressAt = DateTime.now();
 
-      await Future.delayed(const Duration(milliseconds: 250));
+      if (!looksFrame) {
+        await Future.delayed(burstMode ? const Duration(milliseconds: 80) : const Duration(milliseconds: 250));
+      }
     }
 
+    await _resendPending();
+
     setState(() => _status = NodeStatus.idle);
+    if (_debugMode && _buffers.isEmpty) {
+      _setDebugInfo("SYS: idle");
+    }
   }
 
   void _gcBuffers() {
@@ -441,11 +504,11 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   void _handleDeliveryAck(String txt) {
     final label = txt.split(".").first;
     final parts = label.split("-");
-    if (parts.length != 3 && parts.length != 4) return;
+    if (parts.length != 4) return;
     final sid = parts[1].toLowerCase();
     final tot = parts[2];
-    final mid = parts.length == 4 ? parts[3].toLowerCase() : "";
-    final key = mid.isEmpty ? "$sid:$tot" : "$sid:$tot:$mid";
+    final mid = parts[3].toLowerCase();
+    final key = "$sid:$tot:$mid";
     for (int i = 0; i < _messages.length; i++) {
       if (_messages[i]["deliveryKey"] == key) {
         setState(() => _messages[i]["status"] = "delivered");
@@ -454,15 +517,75 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       }
     }
     _pendingDelivery.remove(key);
+    _pendingLastSent.remove(key);
   }
 
   void _rebuildPendingDelivery() {
     _pendingDelivery.clear();
+    _pendingLastSent.clear();
+    final now = DateTime.now();
     for (final msg in _messages) {
       if (msg["status"] == "sent" && msg["deliveryKey"] != null) {
         final key = msg["deliveryKey"].toString();
         _pendingDelivery[key] = 1;
+        _pendingLastSent[key] = DateTime.fromMillisecondsSinceEpoch(0);
       }
+    }
+  }
+
+  Duration _resendBackoff(int attempt) {
+    if (attempt <= 1) return _resendMinInterval;
+    var multiplier = 1 << (attempt - 1);
+    if (multiplier < 1) multiplier = 1;
+    final wait = _resendMinInterval * multiplier;
+    return wait > _resendMaxInterval ? _resendMaxInterval : wait;
+  }
+
+  Future<void> _resendPending() async {
+    if (_pendingDelivery.isEmpty || !_pollingEnabled) return;
+    final now = DateTime.now();
+    final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
+
+    for (final entry in _pendingDelivery.entries) {
+      final key = entry.key;
+      final attempt = entry.value;
+      final lastSent = _pendingLastSent[key] ?? DateTime.fromMillisecondsSinceEpoch(0);
+      if (now.difference(lastSent) < _resendBackoff(attempt)) {
+        continue;
+      }
+
+      Map<String, dynamic>? msg;
+      for (final m in _messages) {
+        if (m["deliveryKey"] == key) {
+          msg = m;
+          break;
+        }
+      }
+      if (msg == null) continue;
+      if (msg["status"] == "delivered") {
+        _pendingDelivery.remove(key);
+        _pendingLastSent.remove(key);
+        continue;
+      }
+
+      final mid = (msg["mid"] ?? "").toString();
+      final to = (msg["to"] ?? _targetID).toString();
+      final chunks = msg["chunks"];
+      if (mid.isEmpty || to.isEmpty || chunks is! List) {
+        continue;
+      }
+
+      final total = chunks.length;
+      for (int i = 0; i < total; i++) {
+        final chunk = chunks[i].toString();
+        if (chunk.isEmpty) continue;
+        final label = "${i + 1}-$total-$mid-$_myID-$to-$chunk";
+        await transport.sendOnly("$label.$_baseDomain", qtype: _sendViaAAAA ? 28 : 1);
+      }
+
+      _pendingDelivery[key] = attempt + 1;
+      _pendingLastSent[key] = now;
+      if (_debugMode) _setDebugInfo("TX: resend $key");
     }
   }
 
@@ -482,8 +605,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
 
       // If header is rotated to the end (out-of-order DNS answers), rotate it back.
       if (!RegExp(r'^\d+-').hasMatch(cleanTxt)) {
-        final headerMatch = RegExp(r'\d+-\d+-[a-z2-7]{5}-[a-z2-7]{5}-[a-z2-7]{5}-').firstMatch(cleanTxt) ??
-            RegExp(r'\d+-\d+-[a-z2-7]{5}-[a-z2-7]{5}-').firstMatch(cleanTxt);
+        final headerMatch = RegExp(r'\d+-\d+-[a-z2-7]{5}-[a-z2-7]{5}-[a-z2-7]{5}-').firstMatch(cleanTxt);
         if (headerMatch != null && headerMatch.start > 0) {
           cleanTxt = cleanTxt.substring(headerMatch.start) + cleanTxt.substring(0, headerMatch.start);
         }
@@ -491,34 +613,23 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
 
       // ۲) فریم باید کامل باشد: idx-tot-sid-rid-payload
       final parts = cleanTxt.split("-");
-      if (parts.length != 5 && parts.length != 6) {
+      if (parts.length != 6) {
         if (_debugMode) print("DEBUG: Still no match for: $cleanTxt");
         return;
       }
 
       final idx = int.tryParse(parts[0]);
       final tot = int.tryParse(parts[1]);
-      String mid = "";
-      String sid = "";
-      String rid = "";
-      String payload = "";
-
-      if (parts.length == 6) {
-        mid = parts[2].toLowerCase();
-        sid = parts[3].toLowerCase();
-        rid = parts[4].toLowerCase();
-        payload = parts[5].trim();
-      } else {
-        sid = parts[2].toLowerCase();
-        rid = parts[3].toLowerCase();
-        payload = parts[4].trim();
-      }
+      final mid = parts[2].toLowerCase();
+      final sid = parts[3].toLowerCase();
+      final rid = parts[4].toLowerCase();
+      final payload = parts[5].trim();
 
       final idRe = RegExp(r'^[a-z2-7]{5}$');
       final payloadRe = RegExp(r'^[a-z2-7]+$');
       if (idx == null || tot == null) return;
       if (!idRe.hasMatch(sid) || !idRe.hasMatch(rid)) return;
-      if (mid.isNotEmpty && !idRe.hasMatch(mid)) return;
+      if (!idRe.hasMatch(mid)) return;
       if (!payloadRe.hasMatch(payload)) return;
 
       if (rid != _myID.toLowerCase()) return;
@@ -528,12 +639,19 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       }
 
       // ✅ DROP empty payloads (prevents empty base32 / decoded bytes 0)
-      if (payload.isEmpty) {
-        if (_debugMode) print("DEBUG: Dropped empty payload frame: $cleanTxt");
-        return;
-      }
+        if (payload.isEmpty) {
+          if (_debugMode) print("DEBUG: Dropped empty payload frame: $cleanTxt");
+          return;
+        }
 
-      final bufKey = mid.isEmpty ? "$sid:$rid:$tot" : "$sid:$rid:$tot:$mid";
+        final dedupKey = _rxDedupKey(sid, mid, tot);
+        if (_isRecentlySeenRx(dedupKey)) {
+          if (_debugMode) print("DEBUG: Dropped late chunk for delivered $dedupKey");
+          _setDebugInfo("RX: late $idx/$tot");
+          return;
+        }
+
+        final bufKey = "$sid:$rid:$tot:$mid";
       final st = _buffers.putIfAbsent(bufKey, () => _RxBufferState(RxAssembly(sid, tot)));
       st.lastUpdatedAt = DateTime.now();
 
@@ -542,15 +660,19 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       if (_debugMode) {
         if (result == AddFrameResult.added) {
           print("DEBUG: Successfully added part $idx/$tot");
+          _setDebugInfo("RX: chunk $idx/$tot");
         } else if (result == AddFrameResult.reset) {
           print("DEBUG: Reset buffer on part $idx/$tot (mismatch detected)");
+          _setDebugInfo("RX: reset at $idx/$tot");
         } else {
           print("DEBUG: Dropped invalid/duplicate part $idx/$tot");
+          _setDebugInfo("RX: dropped $idx/$tot");
         }
       }
 
       if (st.asm.isComplete) {
         if (_debugMode) print("DEBUG: Buffer $bufKey is complete. Assembling...");
+        _setDebugInfo("RX: assembling...");
 
         final String rawAssembled = st.asm.assemble();
         _buffers.remove(bufKey);
@@ -564,9 +686,11 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
         if (_debugMode) print("DEBUG: Final Normalized Base32: $normalized");
 
         try {
+          _setDebugInfo("RX: decoding...");
           final Uint8List decoded = Uint8List.fromList(base32.decode(normalized));
           if (_debugMode) print("DEBUG: Decoded bytes length: ${decoded.length}");
 
+          _setDebugInfo("RX: decrypting...");
           final decrypted = await PeykCrypto.decrypt(decoded);
           
           // Check if decryption actually failed (returns error message)
@@ -589,7 +713,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
           }
 
           if (!mounted) return;
-          final dedupKey = _rxDedupKey(sid, mid, tot, normalized);
+          final dedupKey = _rxDedupKey(sid, mid, tot);
           final isDup = _markSeenRx(dedupKey);
           if (!isDup) {
             if (sid != _targetID.toLowerCase()) {
@@ -613,19 +737,22 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
               _saveHistory();
               await NotificationService.showIncomingMessage(_displayNameForId(sid), decrypted);
             }
+            _setDebugInfo("RX: message ready");
           } else if (_debugMode) {
             print("DEBUG: Dropped duplicate message $dedupKey");
           }
 
           // ACK2 (A + AAAA)
           final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
-          final ackLabel = mid.isEmpty ? "ack2-$sid-$tot" : "ack2-$sid-$tot-$mid";
+          final ackLabel = "ack2-$sid-$tot-$mid";
           final ackNonceA = IdUtils.generateRandomID();
           final ackNonceAAAA = IdUtils.generateRandomID();
           await transport.sendOnly("$ackLabel.$ackNonceA.$_baseDomain", qtype: 1);
           await transport.sendOnly("$ackLabel.$ackNonceAAAA.$_baseDomain", qtype: 28);
+          _setDebugInfo("RX: ACK2 sent");
         } catch (e) {
           if (_debugMode) print("❌ Decryption/Base32 Error: $e");
+          _setDebugInfo("RX: decode error");
         }
       }
     } catch (e) {
@@ -644,19 +771,22 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     return hash.toRadixString(16).padLeft(8, '0');
   }
 
-  String _rxDedupKey(String sid, String mid, int tot, String normalized) {
-    if (mid.isNotEmpty) {
+    String _rxDedupKey(String sid, String mid, int tot) {
       return "$sid:$mid:$tot";
     }
-    return "$sid:$tot:${_hashText(normalized)}";
-  }
 
-  bool _markSeenRx(String key) {
-    final now = DateTime.now();
-    _recentRx.removeWhere((_, ts) => now.difference(ts) > _rxDedupTtl);
-    if (_recentRx.containsKey(key)) {
-      return true;
+    bool _isRecentlySeenRx(String key) {
+      final now = DateTime.now();
+      _recentRx.removeWhere((_, ts) => now.difference(ts) > _rxDedupTtl);
+      return _recentRx.containsKey(key);
     }
+
+    bool _markSeenRx(String key) {
+      final now = DateTime.now();
+      _recentRx.removeWhere((_, ts) => now.difference(ts) > _rxDedupTtl);
+      if (_recentRx.containsKey(key)) {
+        return true;
+      }
     _recentRx[key] = now;
     return false;
   }
@@ -684,7 +814,12 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     final clip = data?.text ?? '';
     if (clip.isEmpty) return;
     final current = _controller.text;
-    _controller.text = current + clip;
+    final combined = current + clip;
+    if (combined.length > _maxMessageChars) {
+      _controller.text = combined.substring(0, _maxMessageChars);
+    } else {
+      _controller.text = combined;
+    }
     _controller.selection = TextSelection.collapsed(offset: _controller.text.length);
   }
 
@@ -897,6 +1032,15 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                 style: const TextStyle(color: Color(0xFF00A884), fontSize: 9, letterSpacing: 1),
               ),
             ),
+            if (_debugMode)
+              Flexible(
+                child: Text(
+                  _debugInfo,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: _textDim, fontSize: 9),
+                ),
+              ),
             if (!_pollingEnabled)
               IconButton(
                 icon: const Icon(Icons.sync, size: 16, color: _accent),
@@ -1009,52 +1153,74 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
           borderRadius: BorderRadius.circular(20),
           border: Border.all(color: const Color(0xFF202C33)),
         ),
-        child: Row(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Expanded(
-              child: TextField(
-                controller: _controller,
-                focusNode: _inputFocus,
-                onTap: () => SystemChannels.textInput.invokeMethod('TextInput.show'),
-                onChanged: (value) {
-                  final rtl = _isRtlText(value);
-                  if (rtl != _inputRtl) {
-                    setState(() => _inputRtl = rtl);
-                  }
-                },
-                keyboardType: TextInputType.multiline,
-                textInputAction: TextInputAction.newline,
-                minLines: 1,
-                maxLines: 4,
-                textDirection: _inputRtl ? TextDirection.rtl : TextDirection.ltr,
-                textAlign: _inputRtl ? TextAlign.right : TextAlign.left,
-                style: const TextStyle(fontSize: 14, color: Colors.white),
-                decoration: InputDecoration(
-                  hintText: _targetID.isEmpty ? "Set Target in Settings" : "Message to $_targetID...",
-                  hintStyle: const TextStyle(color: _textDim),
-                  filled: true,
-                  fillColor: const Color(0xFF202C33),
-                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none),
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: ValueListenableBuilder<TextEditingValue>(
+                    valueListenable: _controller,
+                    builder: (context, value, _) {
+                      final inputRtl = _isRtlText(value.text);
+                      return TextField(
+                        controller: _controller,
+                        focusNode: _inputFocus,
+                        onTap: () => SystemChannels.textInput.invokeMethod('TextInput.show'),
+                        keyboardType: TextInputType.multiline,
+                        textInputAction: TextInputAction.newline,
+                        minLines: 1,
+                        maxLines: 4,
+                        maxLength: _maxMessageChars,
+                        maxLengthEnforcement: MaxLengthEnforcement.enforced,
+                        textDirection: inputRtl ? TextDirection.rtl : TextDirection.ltr,
+                        textAlign: inputRtl ? TextAlign.right : TextAlign.left,
+                        style: const TextStyle(fontSize: 14, color: Colors.white),
+                        decoration: InputDecoration(
+                          hintText: _targetID.isEmpty ? "Set Target in Settings" : "Message to $_targetID...",
+                          hintStyle: const TextStyle(color: _textDim),
+                          filled: true,
+                          fillColor: const Color(0xFF202C33),
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none),
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                          counterText: "",
+                        ),
+                      );
+                    },
+                  ),
                 ),
-              ),
+                const SizedBox(width: 8),
+                IconButton(
+                  icon: const Icon(Icons.paste, color: Color(0xFF00A884), size: 18),
+                  tooltip: "Paste",
+                  onPressed: _pasteFromClipboard,
+                ),
+                Container(
+                  width: 42,
+                  height: 42,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: const Color(0xFF00A884),
+                  ),
+                  child: IconButton(
+                    icon: const Icon(Icons.send, color: Colors.white, size: 20),
+                    onPressed: _sendMessage,
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(width: 8),
-            IconButton(
-              icon: const Icon(Icons.paste, color: Color(0xFF00A884), size: 18),
-              tooltip: "Paste",
-              onPressed: _pasteFromClipboard,
-            ),
-            Container(
-              width: 42,
-              height: 42,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: const Color(0xFF00A884),
-              ),
-              child: IconButton(
-                icon: const Icon(Icons.send, color: Colors.white, size: 20),
-                onPressed: _sendMessage,
+            const SizedBox(height: 4),
+            Align(
+              alignment: Alignment.centerRight,
+              child: ValueListenableBuilder<TextEditingValue>(
+                valueListenable: _controller,
+                builder: (context, value, _) {
+                  final remaining = _maxMessageChars - value.text.characters.length;
+                  return Text(
+                    "$remaining/$_maxMessageChars",
+                    style: const TextStyle(color: _textDim, fontSize: 10),
+                  );
+                },
               ),
             ),
           ],

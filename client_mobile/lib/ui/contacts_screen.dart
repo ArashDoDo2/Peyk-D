@@ -294,13 +294,20 @@ class _ContactsScreenState extends State<ContactsScreen> {
     const int burstMinMs = 200;
     const int burstMaxMs = 400;
     const int maxLoops = 6;
+    const int burstMaxLoops = 60;
     const Duration maxBudget = Duration(seconds: 3);
+    const Duration burstBudget = Duration(seconds: 20);
     final startAt = DateTime.now();
+    var lastProgressAt = startAt;
     int loops = 0;
+    bool burstMode = false;
 
     while (hasMore) {
       if (!_pollingEnabled) break;
-      if (loops >= maxLoops || DateTime.now().difference(startAt) > maxBudget) {
+      final loopLimit = burstMode ? burstMaxLoops : maxLoops;
+      final budgetLimit = burstMode ? burstBudget : maxBudget;
+      final budgetStart = burstMode ? lastProgressAt : startAt;
+      if (loops >= loopLimit || DateTime.now().difference(budgetStart) > budgetLimit) {
         break;
       }
       loops++;
@@ -374,8 +381,14 @@ class _ContactsScreenState extends State<ContactsScreen> {
       } else {
         await _handleIncomingChunk(txt);
       }
+      if (!burstMode && looksFrame) {
+        burstMode = true;
+      }
+      lastProgressAt = DateTime.now();
 
-      await Future.delayed(const Duration(milliseconds: 250));
+      if (!looksFrame) {
+        await Future.delayed(burstMode ? const Duration(milliseconds: 80) : const Duration(milliseconds: 250));
+      }
     }
   }
 
@@ -432,44 +445,32 @@ class _ContactsScreenState extends State<ContactsScreen> {
     String cleanTxt = cleanBuffer.toString().trim().toLowerCase();
 
     if (!RegExp(r'^\d+-').hasMatch(cleanTxt)) {
-      final headerMatch = RegExp(r'\d+-\d+-[a-z2-7]{5}-[a-z2-7]{5}-[a-z2-7]{5}-').firstMatch(cleanTxt) ??
-          RegExp(r'\d+-\d+-[a-z2-7]{5}-[a-z2-7]{5}-').firstMatch(cleanTxt);
+      final headerMatch = RegExp(r'\d+-\d+-[a-z2-7]{5}-[a-z2-7]{5}-[a-z2-7]{5}-').firstMatch(cleanTxt);
       if (headerMatch != null && headerMatch.start > 0) {
         cleanTxt = cleanTxt.substring(headerMatch.start) + cleanTxt.substring(0, headerMatch.start);
       }
     }
 
     final parts = cleanTxt.split("-");
-    if (parts.length != 5 && parts.length != 6) return;
+    if (parts.length != 6) return;
 
     final idx = int.tryParse(parts[0]);
     final tot = int.tryParse(parts[1]);
-    String mid = "";
-    String sid = "";
-    String rid = "";
-    String payload = "";
-
-    if (parts.length == 6) {
-      mid = parts[2].toLowerCase();
-      sid = parts[3].toLowerCase();
-      rid = parts[4].toLowerCase();
-      payload = parts[5].trim();
-    } else {
-      sid = parts[2].toLowerCase();
-      rid = parts[3].toLowerCase();
-      payload = parts[4].trim();
-    }
+    final mid = parts[2].toLowerCase();
+    final sid = parts[3].toLowerCase();
+    final rid = parts[4].toLowerCase();
+    final payload = parts[5].trim();
 
     final idRe = RegExp(r'^[a-z2-7]{5}$');
     final payloadRe = RegExp(r'^[a-z2-7]+$');
     if (idx == null || tot == null) return;
     if (!idRe.hasMatch(sid) || !idRe.hasMatch(rid)) return;
-    if (mid.isNotEmpty && !idRe.hasMatch(mid)) return;
+    if (!idRe.hasMatch(mid)) return;
     if (!payloadRe.hasMatch(payload)) return;
     if (rid != _myId.toLowerCase()) return;
     if (payload.isEmpty) return;
 
-    final bufKey = mid.isEmpty ? "$sid:$rid:$tot" : "$sid:$rid:$tot:$mid";
+    final bufKey = "$sid:$rid:$tot:$mid";
     final st = _buffers.putIfAbsent(bufKey, () => _RxBufferState(RxAssembly(sid, tot)));
     st.lastUpdatedAt = DateTime.now();
     st.asm.addFrame("$idx-$tot-$sid-$rid-$payload");
@@ -499,7 +500,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
         await NotificationService.showIncomingMessage(_displayNameForId(sid), decrypted);
 
         final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
-        final ackLabel = mid.isEmpty ? "ack2-$sid-$tot" : "ack2-$sid-$tot-$mid";
+        final ackLabel = "ack2-$sid-$tot-$mid";
         final ackNonceA = IdUtils.generateRandomID();
         final ackNonceAAAA = IdUtils.generateRandomID();
         await transport.sendOnly("$ackLabel.$ackNonceA.$_baseDomain", qtype: 1);

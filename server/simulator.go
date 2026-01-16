@@ -426,9 +426,9 @@ func sendDirectDNSQuery(domain string, qtype uint16) {
 
 // ✅ Parse ACK2 and compute Peyk latency if it's for our outgoing message
 func handleAck2Metric(txt string) {
-	// format: ACK2-<sid>-<tot> or ACK2-<sid>-<tot>-<mid>
+	// format: ACK2-<sid>-<tot>-<mid>
 	parts := strings.Split(txt, "-")
-	if len(parts) != 3 && len(parts) != 4 {
+	if len(parts) != 4 {
 		return
 	}
 
@@ -437,17 +437,9 @@ func handleAck2Metric(txt string) {
 	if err != nil || tot <= 0 {
 		return
 	}
-	mid := ""
-	if len(parts) == 4 {
-		mid = strings.ToLower(parts[3])
-	}
+	mid := strings.ToLower(parts[3])
 
-	key := ""
-	if mid != "" {
-		key = fmt.Sprintf("%s:%d:%s", sid, tot, mid)
-	} else {
-		key = fmt.Sprintf("%s:%d", sid, tot)
-	}
+	key := fmt.Sprintf("%s:%d:%s", sid, tot, mid)
 
 	txMu.Lock()
 	start, ok := txStartAt[key]
@@ -469,7 +461,7 @@ func handleAck2Metric(txt string) {
 
 func handleIncomingChunk(txt string) {
 	parts := strings.Split(txt, "-")
-	if len(parts) < 5 {
+	if len(parts) < 6 {
 		return
 	}
 
@@ -481,21 +473,13 @@ func handleIncomingChunk(txt string) {
 		return
 	}
 
-	mid := ""
-	senderID := ""
-	receiverID := ""
-	payload := ""
-
-	if len(parts) >= 6 && len(parts[2]) == 5 && len(parts[3]) == 5 && len(parts[4]) == 5 {
-		mid = strings.ToLower(parts[2])
-		senderID = strings.ToLower(parts[3])
-		receiverID = strings.ToLower(parts[4])
-		payload = strings.Join(parts[5:], "-")
-	} else {
-		senderID = strings.ToLower(parts[2])
-		receiverID = strings.ToLower(parts[3])
-		payload = strings.Join(parts[4:], "-")
+	if len(parts[2]) != 5 || len(parts[3]) != 5 || len(parts[4]) != 5 {
+		return
 	}
+	mid := strings.ToLower(parts[2])
+	senderID := strings.ToLower(parts[3])
+	receiverID := strings.ToLower(parts[4])
+	payload := strings.Join(parts[5:], "-")
 
 	if receiverID != strings.ToLower(MY_ID) {
 		return
@@ -504,12 +488,7 @@ func handleIncomingChunk(txt string) {
 		return
 	}
 
-	key := ""
-	if mid != "" {
-		key = fmt.Sprintf("%s-%s-%d-%s", senderID, receiverID, total, mid)
-	} else {
-		key = fmt.Sprintf("%s-%s-%d", senderID, receiverID, total)
-	}
+	key := fmt.Sprintf("%s-%s-%d-%s", senderID, receiverID, total, mid)
 
 	buffersMu.Lock()
 	if _, ok := buffers[key]; !ok {
@@ -578,7 +557,7 @@ func assembleAndDecrypt(key string, total int, senderID string, mid string) {
 
 	fmt.Printf("\n📩 NEW MESSAGE [%s]: %s\n\n", senderID, decrypted)
 
-	// ACK2 (stable format: ack2-sid-tot)
+	// ACK2 (stable format: ack2-sid-tot-mid)
 	go retryAck2Stable(senderID, total, mid)
 }
 
@@ -605,16 +584,11 @@ func isDuplicateAndMark(k string) bool {
 
 // ───────────────────────── ACK2 (Stable) ─────────────────────────
 //
-// Send "ack2-<sid>-<tot>.<base>" (no RID) — matches stable server.
+// Send "ack2-<sid>-<tot>-<mid>.<base>" (no RID) — matches stable server.
 // Retry a few times (best-effort) because DNS can drop.
 
 func retryAck2Stable(senderID string, total int, mid string) {
-	domain := ""
-	if mid != "" {
-		domain = fmt.Sprintf("ack2-%s-%d-%s.%s.%s", strings.ToLower(senderID), total, mid, generateID(), BASE_DOMAIN)
-	} else {
-		domain = fmt.Sprintf("ack2-%s-%d.%s.%s", strings.ToLower(senderID), total, generateID(), BASE_DOMAIN)
-	}
+	domain := fmt.Sprintf("ack2-%s-%d-%s.%s.%s", strings.ToLower(senderID), total, mid, generateID(), BASE_DOMAIN)
 
 	for i := 0; i < 3; i++ {
 		if DIRECT_SERVER_IP != "" {
@@ -627,11 +601,7 @@ func retryAck2Stable(senderID string, total int, mid string) {
 		time.Sleep(350 * time.Millisecond)
 	}
 
-	if mid != "" {
-		fmt.Printf("ACK2 sent for %s/%d mid=%s (stable)\n", senderID, total, mid)
-	} else {
-		fmt.Printf("ACK2 sent for %s/%d (stable)\n", senderID, total)
-	}
+	fmt.Printf("ACK2 sent for %s/%d mid=%s (stable)\n", senderID, total, mid)
 }
 
 // ───────────────────────── TX (Send) ─────────────────────────
@@ -662,7 +632,7 @@ func sendChunks(data string) {
 	mid := generateID()
 
 	// ✅ record Peyk TX start time for latency metric
-	// key is "<MY_ID>:<tot>", matching server ACK2 format: ACK2-<sid>-<tot>
+	// key is "<MY_ID>:<tot>:<mid>", matching server ACK2 format: ACK2-<sid>-<tot>-<mid>
 	txKey := fmt.Sprintf("%s:%d:%s", strings.ToLower(MY_ID), total, mid)
 	txMu.Lock()
 	txStartAt[txKey] = time.Now()
