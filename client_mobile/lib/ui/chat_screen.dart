@@ -197,12 +197,12 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       _targetID = widget.targetId;
       _serverIP = prefs.getString('server_ip') ?? PeykProtocol.defaultServerIP;
       _baseDomain = prefs.getString('base_domain') ?? PeykProtocol.baseDomain;
-      _pollMin = prefs.getInt('poll_min') ?? 20;
-      _pollMax = prefs.getInt('poll_max') ?? 40;
+      _pollMin = prefs.getInt('poll_min') ?? 3;
+      _pollMax = prefs.getInt('poll_max') ?? 10;
       _retryCount = prefs.getInt('retry_count') ?? 1;
       _pollingEnabled = prefs.getBool('polling_enabled') ?? true;
       _debugMode = prefs.getBool('debug_mode') ?? false;
-      _fallbackEnabled = prefs.getBool('fallback_enabled') ?? false;
+      _fallbackEnabled = prefs.getBool('fallback_enabled') ?? true;
       _useDirectServer = prefs.getBool('use_direct_server') ?? false;
       _sendViaAAAA = prefs.getBool('send_via_aaaa') ?? false;
       _contactNames = names;
@@ -1418,9 +1418,9 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                         onChanged: (v) => setL(() => _sendViaAAAA = v),
                       ),
                       Row(children: [
-                        Expanded(child: _buildSettingField(pollMinCtrl, "Min Poll", Icons.timer_outlined, "20", isNum: true)),
+                        Expanded(child: _buildSettingField(pollMinCtrl, "Min Poll", Icons.timer_outlined, "3", isNum: true)),
                         const SizedBox(width: 10),
-                        Expanded(child: _buildSettingField(pollMaxCtrl, "Max Poll", Icons.timer, "40", isNum: true)),
+                        Expanded(child: _buildSettingField(pollMaxCtrl, "Max Poll", Icons.timer, "10", isNum: true)),
                       ]),
                       _buildSettingField(retryCtrl, "Retries", Icons.repeat, "1", isNum: true),
                       SwitchListTile(
@@ -1459,8 +1459,10 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                 await prefs.setString('target_id', targetCtrl.text.trim());
                 await prefs.setString('server_ip', ipCtrl.text.trim());
                 await prefs.setString('base_domain', domainCtrl.text.trim());
-                final nextPollMin = int.tryParse(pollMinCtrl.text) ?? 20;
-                final nextPollMax = int.tryParse(pollMaxCtrl.text) ?? 40;
+                final rawPollMin = int.tryParse(pollMinCtrl.text) ?? 3;
+                final rawPollMax = int.tryParse(pollMaxCtrl.text) ?? 10;
+                final nextPollMin = max(3, rawPollMin);
+                final nextPollMax = max(nextPollMin, rawPollMax);
                 await prefs.setInt('poll_min', nextPollMin);
                 await prefs.setInt('poll_max', nextPollMax);
                 await prefs.setInt('retry_count', int.tryParse(retryCtrl.text) ?? 1);

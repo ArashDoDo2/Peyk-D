@@ -30,6 +30,19 @@ class _ContactsScreenState extends State<ContactsScreen> {
   static const String _contactsKey = 'contacts_list';
   static const String _contactNamesKey = 'contacts_names';
   static const String _unreadKey = 'contacts_unread';
+  static const String _changelogV1 = "تاریخچه تغییرات\n"
+      "2026-01-17 02:08 - بهینه سازی نمایش وضعیت Polling\n"
+      "2026-01-17 02:01 - اصلاح محاسبه درصد دریافت\n"
+      "2026-01-17 01:16 - انتقال Decode/Decrypt به Isolate و رفع قاطی شدن ارسال/دریافت\n"
+      "2026-01-16 22:54 - پاکسازی ACK2 و بهبود Polling\n"
+      "2026-01-16 14:06 - اصلاح نمایش تیک دوم پس از ریست\n"
+      "2026-01-16 13:21 - بهبود پشتیبانی RTL در ورودی و حباب پیام\n"
+      "2026-01-16 13:16 - نوتیفیکیشن محلی + بهبود فوکوس ورودی\n"
+      "2026-01-16 11:58 - Backoff ارسال مجدد و حذف تکراری های دریافت\n"
+      "2026-01-15 17:02 - افزودن لیست مخاطبین و تاریخچه پیام هر چت\n"
+      "2026-01-15 02:16 - جایگزینی تونل TXT با AAAA/A\n"
+      "2026-01-14 18:51 - بهبود ارسال پیام های طولانی\n"
+      "2026-01-13 16:52 - تنظیم دامنه پایه و ذخیره تنظیمات";
 
   String _myId = '';
   List<String> _contacts = [];
@@ -47,6 +60,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
   String _serverIP = '';
   final Map<String, _RxBufferState> _buffers = {};
 
+  static const int _contactsPollSeconds = 30;
   static const Duration _bufferTtl = Duration(seconds: 90);
 
   @override
@@ -99,10 +113,10 @@ class _ContactsScreenState extends State<ContactsScreen> {
       _contacts = contacts.where(IdUtils.isValid).toList();
       _names = names;
       _unread = unread;
-      _pollMin = prefs.getInt('poll_min') ?? 20;
-      _pollMax = prefs.getInt('poll_max') ?? 40;
+      _pollMin = prefs.getInt('poll_min') ?? 3;
+      _pollMax = prefs.getInt('poll_max') ?? 10;
       _pollingEnabled = prefs.getBool('polling_enabled') ?? true;
-      _fallbackEnabled = prefs.getBool('fallback_enabled') ?? false;
+      _fallbackEnabled = prefs.getBool('fallback_enabled') ?? true;
       _useDirectServer = prefs.getBool('use_direct_server') ?? false;
       _baseDomain = prefs.getString('base_domain') ?? 'p99.online.ir';
       _serverIP = prefs.getString('server_ip') ?? '';
@@ -262,11 +276,71 @@ class _ContactsScreenState extends State<ContactsScreen> {
     );
   }
 
+  Future<void> _showAbout() async {
+    await showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF111B21),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: BorderSide(color: const Color(0xFF00A884).withOpacity(0.3)),
+        ),
+        title: const Text(
+          "درباره",
+          style: TextStyle(fontSize: 12, letterSpacing: 2, fontWeight: FontWeight.bold, color: Color(0xFF00A884)),
+        ),
+        content: const Directionality(
+          textDirection: TextDirection.rtl,
+          child: Text(
+            "این نرم افزار در دوره قطع کامل اینترنت ایران برای ایجاد یک کانال ارتباطی اضطراری ساخته شد. این یک پیامرسان کامل نیست و محدودیت های آن به دلیل تکیه بر حداقل امکانات ارتباطی موجود است.",
+            style: TextStyle(fontSize: 12, color: Colors.white70, height: 1.5),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: _showChangelog, child: const Text("تاریخچه تغییرات", style: TextStyle(color: Color(0xFF00A884)))),
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("بستن", style: TextStyle(color: Colors.white30))),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showChangelog() async {
+    await showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF111B21),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: BorderSide(color: const Color(0xFF00A884).withOpacity(0.3)),
+        ),
+        title: const Text(
+          "تاریخچه تغییرات",
+          style: TextStyle(fontSize: 12, letterSpacing: 2, fontWeight: FontWeight.bold, color: Color(0xFF00A884)),
+        ),
+        content: Directionality(
+          textDirection: TextDirection.rtl,
+          child: SizedBox(
+            width: double.maxFinite,
+            height: 240,
+            child: SingleChildScrollView(
+              child: Text(
+                _changelogV1,
+                style: const TextStyle(fontSize: 12, color: Colors.white70, height: 1.5),
+              ),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("بستن", style: TextStyle(color: Colors.white30))),
+        ],
+      ),
+    );
+  }
+
   void _startPolling() {
     _pollTimer?.cancel();
     if (!_pollingEnabled) return;
-    final seconds = _pollMin + Random().nextInt(max(1, _pollMax - _pollMin + 1));
-    _pollTimer = Timer.periodic(Duration(seconds: seconds), (_) => _fetchBuffer());
+    _pollTimer = Timer.periodic(const Duration(seconds: _contactsPollSeconds), (_) => _fetchBuffer());
   }
 
   void _gcBuffers() {
@@ -530,6 +604,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
       appBar: AppBar(
         title: const Text("CONTACTS", style: TextStyle(letterSpacing: 3, fontSize: 12, fontWeight: FontWeight.bold)),
         actions: [
+          IconButton(icon: const Icon(Icons.info_outline, size: 20), onPressed: _showAbout),
           IconButton(icon: const Icon(Icons.add, size: 20), onPressed: _showAddContact),
         ],
       ),
