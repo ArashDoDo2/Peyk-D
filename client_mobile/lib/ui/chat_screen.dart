@@ -23,10 +23,12 @@ class _RxBufferState {
   final RxAssembly asm;
   DateTime createdAt;
   DateTime lastUpdatedAt;
+  int lastPercent;
 
   _RxBufferState(this.asm)
       : createdAt = DateTime.now(),
-        lastUpdatedAt = DateTime.now();
+        lastUpdatedAt = DateTime.now(),
+        lastPercent = 0;
 }
 
 class ChatScreen extends StatefulWidget {
@@ -111,12 +113,29 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   int? _currentRxPercent() {
     if (_buffers.isEmpty) return null;
     _RxBufferState? latest;
-    for (final st in _buffers.values) {
+    for (final entry in _buffers.entries) {
+      final key = entry.key;
+      final st = entry.value;
+      final parts = key.split(":");
+      if (parts.length >= 4) {
+        final sid = parts[0];
+        if (sid != _targetID.toLowerCase()) {
+          continue;
+        }
+      }
       if (latest == null || st.lastUpdatedAt.isAfter(latest.lastUpdatedAt)) {
         latest = st;
       }
     }
+    if (latest == null) {
+      for (final st in _buffers.values) {
+        if (latest == null || st.lastUpdatedAt.isAfter(latest.lastUpdatedAt)) {
+          latest = st;
+        }
+      }
+    }
     if (latest == null) return null;
+    if (latest.lastPercent > 0) return latest.lastPercent.clamp(0, 100);
     final total = latest.asm.total;
     if (total <= 0) return null;
     final received = latest.asm.receivedCount;
@@ -664,6 +683,14 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
 
       // add full frame (safe)
       final result = st.asm.addFrame("$idx-$tot-$sid-$rid-$payload");
+      final totalParts = st.asm.total;
+      if (totalParts > 0) {
+        final received = st.asm.receivedCount;
+        final pct = ((received * 100) / totalParts).floor();
+        if (pct > st.lastPercent) {
+          st.lastPercent = pct.clamp(0, 100);
+        }
+      }
       if (_debugMode) {
         if (result == AddFrameResult.added) {
           print("DEBUG: Successfully added part $idx/$tot");
