@@ -41,6 +41,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   final List<Map<String, dynamic>> _messages = [];
   final Map<String, _RxBufferState> _buffers = {};
   final Map<String, int> _pendingDelivery = {};
+  final Map<String, DateTime> _recentRx = {};
   Map<String, String> _contactNames = {};
   final ScrollController _chatScrollCtrl = ScrollController();
   bool _showJumpToBottom = false;
@@ -67,6 +68,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
 
   static const Duration _bufferTtl = Duration(seconds: 90);
   static const int _historyMax = 200;
+  static const Duration _rxDedupTtl = Duration(minutes: 10);
   static const Color _accent = Color(0xFF00A884);
   static const Color _accentAlt = Color(0xFF25D366);
   static const Color _panel = Color(0xFF111B21);
@@ -560,25 +562,31 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
           }
 
           if (!mounted) return;
-          if (sid != _targetID.toLowerCase()) {
-            await _appendToHistoryForTarget(sid, {
-              "text": decrypted,
-              "status": "received",
-              "from": sid,
-              "time": _getTime(),
-            });
-            await _incrementUnread(sid);
-            return;
+          final dedupKey = _rxDedupKey(sid, mid, tot, normalized);
+          final isDup = _markSeenRx(dedupKey);
+          if (!isDup) {
+            if (sid != _targetID.toLowerCase()) {
+              await _appendToHistoryForTarget(sid, {
+                "text": decrypted,
+                "status": "received",
+                "from": sid,
+                "time": _getTime(),
+              });
+              await _incrementUnread(sid);
+            } else {
+              setState(() {
+                _messages.insert(0, {
+                  "text": decrypted,
+                  "status": "received",
+                  "from": sid,
+                  "time": _getTime(),
+                });
+              });
+              _saveHistory();
+            }
+          } else if (_debugMode) {
+            print("DEBUG: Dropped duplicate message $dedupKey");
           }
-          setState(() {
-            _messages.insert(0, {
-              "text": decrypted,
-              "status": "received",
-              "from": sid,
-              "time": _getTime(),
-            });
-          });
-          _saveHistory();
 
           // ACK2 (A + AAAA)
           final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
@@ -597,6 +605,32 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   }
 
   String _getTime() => "${DateTime.now().hour}:${DateTime.now().minute.toString().padLeft(2, '0')}";
+
+  String _hashText(String input) {
+    int hash = 0x811c9dc5;
+    for (int i = 0; i < input.length; i++) {
+      hash ^= input.codeUnitAt(i);
+      hash = (hash * 0x01000193) & 0xffffffff;
+    }
+    return hash.toRadixString(16).padLeft(8, '0');
+  }
+
+  String _rxDedupKey(String sid, String mid, int tot, String normalized) {
+    if (mid.isNotEmpty) {
+      return "$sid:$mid:$tot";
+    }
+    return "$sid:$tot:${_hashText(normalized)}";
+  }
+
+  bool _markSeenRx(String key) {
+    final now = DateTime.now();
+    _recentRx.removeWhere((_, ts) => now.difference(ts) > _rxDedupTtl);
+    if (_recentRx.containsKey(key)) {
+      return true;
+    }
+    _recentRx[key] = now;
+    return false;
+  }
 
   String _displayNameForId(String id) {
     final key = id.toLowerCase();

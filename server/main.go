@@ -34,6 +34,9 @@ const (
 	ACK2_TTL           = 24 * time.Hour
 	ENABLE_EVENT_LOG   = true
 	ENABLE_COLOR_LOG   = true
+	RESEND_BACKOFF_START = 6
+	RESEND_BACKOFF_MAX  = 30 * time.Second
+	LEGACY_RESEND_CAP   = 60
 )
 
 // DNS Types
@@ -56,6 +59,11 @@ type ChunkEnvelope struct {
 	AddedAt time.Time
 }
 
+type sendState struct {
+	Count    int
+	LastSent time.Time
+}
+
 // messageStore:
 // map[receiverID]map[messageKey][]ChunkEnvelope
 // messageKey = sid + ":" + tot
@@ -69,6 +77,7 @@ var (
 	msgFirstAt   = make(map[string]time.Time)
 	sendFirstAt  = make(map[string]time.Time)
 	sendCursor   = make(map[string]int)
+	sendStates   = make(map[string]sendState)
 
 	storeMu sync.Mutex
 )
@@ -285,6 +294,7 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 				delete(msgs, msgKey)
 				delete(sendCursor, fmt.Sprintf("%s|%s", rid, msgKey))
 				delete(msgFirstAt, fmt.Sprintf("%s|%s", rid, msgKey))
+				delete(sendStates, fmt.Sprintf("%s|%s", rid, msgKey))
 				if start, okStart := sendFirstAt[fmt.Sprintf("%s|%s", rid, msgKey)]; okStart {
 					delete(sendFirstAt, fmt.Sprintf("%s|%s", rid, msgKey))
 					logEvent("[MSG-TX]", "\x1b[33m", "ack received sid=%s -> rid=%s parts=%d took=%s", sid, rid, tot, time.Since(start))
@@ -450,8 +460,30 @@ func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain str
 		return
 	}
 
+	now := time.Now()
 	for key, chunks := range msgs {
 		keyFull := fmt.Sprintf("%s|%s", rid, key)
+		state := sendStates[keyFull]
+		if !state.LastSent.IsZero() {
+			backoff := resendBackoff(state.Count)
+			if backoff > 0 && now.Sub(state.LastSent) < backoff {
+				continue
+			}
+		}
+
+		if chunks[0].MID == "" && state.Count >= LEGACY_RESEND_CAP {
+			logIf(ENABLE_POLL_LOG, "poll rid=%s from=%s -> DROP legacy key=%s after=%d sends", rid, addr.String(), key, state.Count)
+			delete(msgs, key)
+			delete(sendCursor, keyFull)
+			delete(msgFirstAt, keyFull)
+			delete(sendFirstAt, keyFull)
+			delete(sendStates, keyFull)
+			if len(msgs) == 0 {
+				delete(messageStore, rid)
+			}
+			continue
+		}
+
 		nextIdx := sendCursor[keyFull]
 		if nextIdx <= 0 {
 			nextIdx = 1
@@ -499,8 +531,11 @@ func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain str
 
 		leftInKey := len(chunks)
 		if _, ok := sendFirstAt[keyFull]; !ok {
-			sendFirstAt[keyFull] = time.Now()
+			sendFirstAt[keyFull] = now
 		}
+		state.Count++
+		state.LastSent = now
+		sendStates[keyFull] = state
 		storeMu.Unlock()
 
 		logIf(ENABLE_POLL_LOG, "poll rid=%s from=%s -> CHUNK key=%s sent=%d/%d sid=%s payloadLen=%d leftInKey=%d viaQ=%d preview=%q",
@@ -524,6 +559,21 @@ func sendPollingPayload(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domai
 	}
 	// fallback: A
 	sendABytesResponse(conn, addr, txID, domain, []byte(payload), qclass)
+}
+
+func resendBackoff(count int) time.Duration {
+	if count < RESEND_BACKOFF_START {
+		return 0
+	}
+	step := count - RESEND_BACKOFF_START
+	if step < 0 {
+		return 0
+	}
+	delay := time.Duration(1<<step) * time.Second
+	if delay > RESEND_BACKOFF_MAX {
+		return RESEND_BACKOFF_MAX
+	}
+	return delay
 }
 
 // ───────────────────────── GC ─────────────────────────
@@ -586,6 +636,11 @@ func garbageCollector() {
 			if _, ok := sendFirstAt[key]; !ok {
 				// cursor without active key (message expired or cleaned)
 				delete(sendCursor, key)
+			}
+		}
+		for key := range sendStates {
+			if _, ok := sendFirstAt[key]; !ok {
+				delete(sendStates, key)
 			}
 		}
 		storeMu.Unlock()
