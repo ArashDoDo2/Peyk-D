@@ -47,6 +47,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   Map<String, String> _contactNames = {};
   final ScrollController _chatScrollCtrl = ScrollController();
   bool _showJumpToBottom = false;
+  bool _inputRtl = false;
   static const String _unreadKey = 'contacts_unread';
 
   String _myID = '';
@@ -656,6 +657,10 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     return _contactNames[key] ?? id;
   }
 
+  bool _isRtlText(String text) {
+    return RegExp(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]').hasMatch(text);
+  }
+
   Future<void> _copyToClipboard(String text) async {
     if (text.isEmpty) return;
     await Clipboard.setData(ClipboardData(text: text));
@@ -909,6 +914,8 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
 
   Widget _buildMessageBubble(Map<String, dynamic> msg) {
     bool isRx = msg["status"] == "received";
+    final textValue = (msg["text"] ?? "").toString();
+    final isRtlMsg = _isRtlText(textValue);
     final bubble = Container(
       margin: const EdgeInsets.symmetric(vertical: 6),
       padding: const EdgeInsets.all(12),
@@ -924,17 +931,25 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
         crossAxisAlignment: isRx ? CrossAxisAlignment.start : CrossAxisAlignment.end,
         children: [
           if (isRx)
-            Text(
-              _displayNameForId((msg["from"] ?? "").toString()),
-              style: const TextStyle(color: Color(0xFF00A884), fontSize: 8, fontWeight: FontWeight.bold, letterSpacing: 1),
+            Align(
+              alignment: isRtlMsg ? Alignment.centerRight : Alignment.centerLeft,
+              child: Text(
+                _displayNameForId((msg["from"] ?? "").toString()),
+                textDirection: isRtlMsg ? TextDirection.rtl : TextDirection.ltr,
+                textAlign: isRtlMsg ? TextAlign.right : TextAlign.left,
+                style: const TextStyle(color: Color(0xFF00A884), fontSize: 8, fontWeight: FontWeight.bold, letterSpacing: 1),
+              ),
             ),
           SelectableText(
-            msg["text"],
+            textValue,
             style: const TextStyle(color: Colors.white, fontSize: 13, height: 1.25),
+            textDirection: isRtlMsg ? TextDirection.rtl : TextDirection.ltr,
+            textAlign: isRtlMsg ? TextAlign.right : TextAlign.left,
           ),
           const SizedBox(height: 4),
           Row(
             mainAxisSize: MainAxisSize.min,
+            textDirection: isRtlMsg ? TextDirection.rtl : TextDirection.ltr,
             children: [
               Text(msg["time"], style: const TextStyle(color: _textDim, fontSize: 8)),
               const SizedBox(width: 4),
@@ -992,10 +1007,18 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                 controller: _controller,
                 focusNode: _inputFocus,
                 onTap: () => SystemChannels.textInput.invokeMethod('TextInput.show'),
+                onChanged: (value) {
+                  final rtl = _isRtlText(value);
+                  if (rtl != _inputRtl) {
+                    setState(() => _inputRtl = rtl);
+                  }
+                },
                 keyboardType: TextInputType.multiline,
                 textInputAction: TextInputAction.newline,
                 minLines: 1,
                 maxLines: 4,
+                textDirection: _inputRtl ? TextDirection.rtl : TextDirection.ltr,
+                textAlign: _inputRtl ? TextAlign.right : TextAlign.left,
                 style: const TextStyle(fontSize: 14, color: Colors.white),
                 decoration: InputDecoration(
                   hintText: _targetID.isEmpty ? "Set Target in Settings" : "Message to $_targetID...",
