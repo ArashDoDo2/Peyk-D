@@ -69,6 +69,9 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   int _pollMax = 40;
   int _retryCount = 1;
   String _debugInfo = "";
+  int _txPercent = 0;
+  bool _txActive = false;
+  DateTime _lastTxUiUpdate = DateTime.fromMillisecondsSinceEpoch(0);
 
   Timer? _pollTimer;
   late AnimationController _glowCtrl;
@@ -107,7 +110,27 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
 
   void _setDebugInfo(String info) {
     if (!_debugMode) return;
+    if (_debugInfo == info) {
+      return;
+    }
     setState(() => _debugInfo = info);
+  }
+
+  String _pollDebugLabel() {
+    final pct = _currentRxPercent();
+    if (pct == null) {
+      return "RX: wait";
+    }
+    return "RX: ${pct}%";
+  }
+
+  void _setTxPercent(int pct) {
+    final now = DateTime.now();
+    if (pct == _txPercent && now.difference(_lastTxUiUpdate) < const Duration(milliseconds: 250)) {
+      return;
+    }
+    _lastTxUiUpdate = now;
+    setState(() => _txPercent = pct.clamp(0, 100));
   }
 
   int? _currentRxPercent() {
@@ -296,6 +319,8 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     setState(() {
       _messages.insert(0, msg);
       _status = NodeStatus.sending;
+      _txActive = true;
+      _txPercent = 0;
     });
     await _saveHistory();
 
@@ -323,18 +348,31 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
         for (int r = 0; r <= _retryCount; r++) {
           await transport.sendOnly("$label.$_baseDomain", qtype: _sendViaAAAA ? 28 : 1);
         }
+        final pct = (((i + 1) * 100) / chunks.length).floor();
+        _setTxPercent(pct);
       }
       _setDebugInfo("TX: sent ${chunks.length}/${chunks.length}");
       setState(() {
         msg["status"] = "sent";
         _status = NodeStatus.success;
+        _txPercent = 100;
       });
       await _saveHistory();
     } catch (e) {
       _setDebugInfo("TX: error");
-      setState(() => _status = NodeStatus.error);
+      setState(() {
+        _status = NodeStatus.error;
+        _txActive = false;
+      });
     }
-    Future.delayed(const Duration(seconds: 2), () => setState(() => _status = NodeStatus.idle));
+    Future.delayed(const Duration(seconds: 2), () {
+      if (!mounted) return;
+      setState(() {
+        _status = NodeStatus.idle;
+        _txActive = false;
+        _txPercent = 0;
+      });
+    });
   }
 
   List<String> _makeChunks(String data) {
@@ -381,8 +419,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     if (_status != NodeStatus.idle && _status != NodeStatus.polling) return;
     setState(() => _status = NodeStatus.polling);
     if (_debugMode) {
-      final pct = _currentRxPercent();
-      _setDebugInfo(pct == null ? "RX: polling..." : "RX: polling ${pct}%");
+      _setDebugInfo(_pollDebugLabel());
     }
     _gcBuffers();
 
@@ -410,8 +447,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       }
       loops++;
       if (_debugMode) {
-        final pct = _currentRxPercent();
-        _setDebugInfo(pct == null ? "RX: polling..." : "RX: polling ${pct}%");
+        _setDebugInfo(_pollDebugLabel());
       }
 
       Uint8List? rawBytes;
@@ -1066,9 +1102,21 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
             Expanded(
               child: Text(
                 "SYS: ${_status.name.toUpperCase()} | NODE: $_myID",
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
                 style: const TextStyle(color: Color(0xFF00A884), fontSize: 9, letterSpacing: 1),
               ),
             ),
+            if (_txActive)
+              Padding(
+                padding: const EdgeInsets.only(left: 6),
+                child: Text(
+                  "TX ${_txPercent}%",
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: _textDim, fontSize: 9),
+                ),
+              ),
             if (_debugMode)
               Flexible(
                 child: Text(
