@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:async';
 import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:base32/base32.dart';
@@ -13,6 +14,7 @@ import '../core/crypto.dart';
 import '../core/notifications.dart';
 import '../core/rx_assembly.dart';
 import '../core/transport.dart';
+import '../core/decode_worker.dart';
 import '../utils/id.dart';
 
 enum NodeStatus { idle, polling, sending, success, error }
@@ -266,8 +268,14 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     if (text.isEmpty || !IdUtils.isValid(_targetID)) return;
     _controller.clear();
 
+    final msg = <String, dynamic>{
+      "text": text,
+      "status": "sending",
+      "time": _getTime(),
+      "to": _targetID,
+    };
     setState(() {
-      _messages.insert(0, {"text": text, "status": "sending", "time": _getTime()});
+      _messages.insert(0, msg);
       _status = NodeStatus.sending;
     });
     await _saveHistory();
@@ -282,10 +290,9 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       final mid = IdUtils.generateRandomID();
 
       final ackKey = "${_myID.toLowerCase()}:${chunks.length}:$mid";
-      _messages[0]["mid"] = mid;
-      _messages[0]["chunks"] = chunks;
-      _messages[0]["to"] = _targetID;
-      _messages[0]["deliveryKey"] = ackKey;
+      msg["mid"] = mid;
+      msg["chunks"] = chunks;
+      msg["deliveryKey"] = ackKey;
       _pendingDelivery[ackKey] = 1;
       _pendingLastSent[ackKey] = DateTime.now();
 
@@ -300,7 +307,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       }
       _setDebugInfo("TX: sent ${chunks.length}/${chunks.length}");
       setState(() {
-        _messages[0]["status"] = "sent";
+        msg["status"] = "sent";
         _status = NodeStatus.success;
       });
       await _saveHistory();
@@ -379,7 +386,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       final loopLimit = burstMode ? burstMaxLoops : maxLoops;
       final budgetLimit = burstMode ? burstBudget : maxBudget;
       final budgetStart = burstMode ? lastProgressAt : startAt;
-    if (loops >= loopLimit || DateTime.now().difference(budgetStart) > budgetLimit) {
+      if (loops >= loopLimit || DateTime.now().difference(budgetStart) > budgetLimit) {
         break;
       }
       loops++;
@@ -677,27 +684,30 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
         final String rawAssembled = st.asm.assemble();
         _buffers.remove(bufKey);
 
-        // normalize base32
-        String normalized = rawAssembled.toUpperCase().replaceAll(RegExp(r'[^A-Z2-7]'), '');
-        while (normalized.length % 8 != 0) {
-          normalized += '=';
-        }
-
-        if (_debugMode) print("DEBUG: Final Normalized Base32: $normalized");
-
         try {
           _setDebugInfo("RX: decoding...");
-          final Uint8List decoded = Uint8List.fromList(base32.decode(normalized));
-          if (_debugMode) print("DEBUG: Decoded bytes length: ${decoded.length}");
-
-          _setDebugInfo("RX: decrypting...");
-          final decrypted = await PeykCrypto.decrypt(decoded);
+          final result = await compute(decodeAndDecrypt, {
+            "raw": rawAssembled,
+            "debug": _debugMode,
+          });
+          final decrypted = (result["decrypted"] as String?) ?? "Decryption error: empty result";
+          final decodedLen = (result["decodedLen"] as int?) ?? 0;
+          if (_debugMode) {
+            final normalized = (result["normalized"] as String?) ?? "";
+            if (normalized.isNotEmpty) {
+              print("DEBUG: Final Normalized Base32: $normalized");
+            }
+            print("DEBUG: Decoded bytes length: $decodedLen");
+          }
           
           // Check if decryption actually failed (returns error message)
           if (decrypted.startsWith("Error") || decrypted.startsWith("Decryption error")) {
             if (_debugMode) print("❌ Decryption failed: $decrypted");
             if (_debugMode) print("DEBUG: Raw assembled payload was: $rawAssembled");
-            if (_debugMode) print("DEBUG: Normalized base32 was: $normalized");
+            final normalized = (result["normalized"] as String?) ?? "";
+            if (_debugMode && normalized.isNotEmpty) {
+              print("DEBUG: Normalized base32 was: $normalized");
+            }
             // Still show the error message to user for debugging
             if (!mounted) return;
             setState(() {

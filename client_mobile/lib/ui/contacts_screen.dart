@@ -1,15 +1,14 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'dart:convert';
 import 'dart:async';
 import 'dart:math';
-import 'dart:typed_data';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:base32/base32.dart';
 
-import '../core/crypto.dart';
 import '../core/notifications.dart';
 import '../core/rx_assembly.dart';
 import '../core/transport.dart';
+import '../core/decode_worker.dart';
 import '../utils/id.dart';
 import 'chat_screen.dart';
 
@@ -479,14 +478,12 @@ class _ContactsScreenState extends State<ContactsScreen> {
       final String rawAssembled = st.asm.assemble();
       _buffers.remove(bufKey);
 
-      String normalized = rawAssembled.toUpperCase().replaceAll(RegExp(r'[^A-Z2-7]'), '');
-      while (normalized.length % 8 != 0) {
-        normalized += '=';
-      }
-
       try {
-        final decoded = Uint8List.fromList(base32.decode(normalized));
-        final decrypted = await PeykCrypto.decrypt(decoded);
+        final result = await compute(decodeAndDecrypt, {
+          "raw": rawAssembled,
+          "debug": false,
+        });
+        final decrypted = (result["decrypted"] as String?) ?? "Decryption error: empty result";
         if (decrypted.startsWith("Error") || decrypted.startsWith("Decryption error")) {
           return;
         }
