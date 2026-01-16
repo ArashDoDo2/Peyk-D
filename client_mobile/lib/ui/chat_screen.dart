@@ -10,6 +10,7 @@ import 'package:base32/base32.dart';
 // Core layers
 import '../core/protocol.dart';
 import '../core/crypto.dart';
+import '../core/notifications.dart';
 import '../core/rx_assembly.dart';
 import '../core/transport.dart';
 import '../utils/id.dart';
@@ -38,6 +39,7 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateMixin {
   final TextEditingController _controller = TextEditingController();
+  final FocusNode _inputFocus = FocusNode();
   final List<Map<String, dynamic>> _messages = [];
   final Map<String, _RxBufferState> _buffers = {};
   final Map<String, int> _pendingDelivery = {};
@@ -81,6 +83,11 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     _setupAnimations();
     _loadSettings();
     _chatScrollCtrl.addListener(_handleChatScroll);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _inputFocus.requestFocus();
+      SystemChannels.textInput.invokeMethod('TextInput.hide');
+    });
   }
 
   void _setupAnimations() {
@@ -315,8 +322,18 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     const int burstAttempts = 3;
     const int burstMinMs = 200;
     const int burstMaxMs = 400;
+    const int maxLoops = 6;
+    const Duration maxBudget = Duration(seconds: 3);
+    final startAt = DateTime.now();
+    int loops = 0;
 
     while (hasMore) {
+      if (!_pollingEnabled) break;
+      if (loops >= maxLoops || DateTime.now().difference(startAt) > maxBudget) {
+        break;
+      }
+      loops++;
+
       Uint8List? rawBytes;
       String txt = "";
       var usedAAAA = true;
@@ -573,6 +590,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                 "time": _getTime(),
               });
               await _incrementUnread(sid);
+              await NotificationService.showIncomingMessage(_displayNameForId(sid), decrypted);
             } else {
               setState(() {
                 _messages.insert(0, {
@@ -583,6 +601,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                 });
               });
               _saveHistory();
+              await NotificationService.showIncomingMessage(_displayNameForId(sid), decrypted);
             }
           } else if (_debugMode) {
             print("DEBUG: Dropped duplicate message $dedupKey");
@@ -735,7 +754,14 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
             ),
           ),
         ),
-        actions: [IconButton(icon: const Icon(Icons.settings, size: 20), onPressed: _showSettings)],
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.delete_sweep, size: 20),
+            tooltip: "Clear Chat",
+            onPressed: _confirmClearHistory,
+          ),
+          IconButton(icon: const Icon(Icons.settings, size: 20), onPressed: _showSettings),
+        ],
       ),
       body: Stack(
         children: [
@@ -964,6 +990,12 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
             Expanded(
               child: TextField(
                 controller: _controller,
+                focusNode: _inputFocus,
+                onTap: () => SystemChannels.textInput.invokeMethod('TextInput.show'),
+                keyboardType: TextInputType.multiline,
+                textInputAction: TextInputAction.newline,
+                minLines: 1,
+                maxLines: 4,
                 style: const TextStyle(fontSize: 14, color: Colors.white),
                 decoration: InputDecoration(
                   hintText: _targetID.isEmpty ? "Set Target in Settings" : "Message to $_targetID...",
@@ -1007,7 +1039,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     final pollMinCtrl = TextEditingController(text: _pollMin.toString());
     final pollMaxCtrl = TextEditingController(text: _pollMax.toString());
     final retryCtrl = TextEditingController(text: _retryCount.toString());
-    bool advancedOpen = true;
+    bool advancedOpen = false;
 
     if (!mounted) return;
 
@@ -1188,6 +1220,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   void dispose() {
     _pollTimer?.cancel();
     _glowCtrl.dispose();
+    _inputFocus.dispose();
     _controller.dispose();
     _chatScrollCtrl.dispose();
     super.dispose();

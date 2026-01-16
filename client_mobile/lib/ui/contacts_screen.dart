@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:base32/base32.dart';
 
 import '../core/crypto.dart';
+import '../core/notifications.dart';
 import '../core/rx_assembly.dart';
 import '../core/transport.dart';
 import '../utils/id.dart';
@@ -123,6 +124,12 @@ class _ContactsScreenState extends State<ContactsScreen> {
       MaterialPageRoute(builder: (_) => ChatScreen(targetId: targetId, displayName: displayName)),
     );
     await _loadState();
+  }
+
+  String _displayNameForId(String id) {
+    final name = _names[id];
+    if (name != null && name.trim().isNotEmpty) return name;
+    return id;
   }
 
   Future<void> _showAddContact() async {
@@ -286,8 +293,18 @@ class _ContactsScreenState extends State<ContactsScreen> {
     const int burstAttempts = 3;
     const int burstMinMs = 200;
     const int burstMaxMs = 400;
+    const int maxLoops = 6;
+    const Duration maxBudget = Duration(seconds: 3);
+    final startAt = DateTime.now();
+    int loops = 0;
 
     while (hasMore) {
+      if (!_pollingEnabled) break;
+      if (loops >= maxLoops || DateTime.now().difference(startAt) > maxBudget) {
+        break;
+      }
+      loops++;
+
       Uint8List? rawBytes;
       String txt = "";
       var usedAAAA = true;
@@ -479,6 +496,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
           "time": _getTime(),
         });
         await _incrementUnread(sid);
+        await NotificationService.showIncomingMessage(_displayNameForId(sid), decrypted);
 
         final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
         final ackLabel = mid.isEmpty ? "ack2-$sid-$tot" : "ack2-$sid-$tot-$mid";

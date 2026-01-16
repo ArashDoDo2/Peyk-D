@@ -1,8 +1,31 @@
 import 'package:flutter/material.dart';
+import 'core/notifications.dart';
 import 'ui/contacts_screen.dart';
 
-class PeykDApp extends StatelessWidget {
+class PeykDApp extends StatefulWidget {
   const PeykDApp({super.key});
+
+  @override
+  State<PeykDApp> createState() => _PeykDAppState();
+}
+
+class _PeykDAppState extends State<PeykDApp> with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    NotificationService.isForeground = state == AppLifecycleState.resumed;
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
