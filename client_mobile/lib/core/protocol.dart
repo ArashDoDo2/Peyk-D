@@ -10,6 +10,7 @@ class PeykProtocol {
     // DNS QTYPEs
   static const int qtypeA = 1;
   static const int qtypeTXT = 16;
+  static const int qtypeAAAA = 28;
 
   // متد کمکی برای چک کردن فرمت آی‌دی (۵ کاراکتر a-z یا ۲-۷)
   static bool isValidID(String id) {

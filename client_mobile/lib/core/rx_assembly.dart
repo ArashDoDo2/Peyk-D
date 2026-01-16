@@ -1,3 +1,5 @@
+enum AddFrameResult { added, duplicate, reset, rejected }
+
 class RxAssembly {
   final String sid;
   final int total;
@@ -6,23 +8,44 @@ class RxAssembly {
 
   RxAssembly(this.sid, this.total);
 
-  void addPart(int idx, String payload) {
-    _parts[idx] = payload;
+  /// فریم کامل:
+  /// idx-tot-sid-rid-payload
+  AddFrameResult addFrame(String frame) {
+    final parts = frame.split('-');
+    if (parts.length < 5) return AddFrameResult.rejected;
+
+    final idx = int.tryParse(parts[0]);
+    final tot = int.tryParse(parts[1]);
+    final frameSid = parts[2];
+    // parts[3] = rid (receiver id)
+    final data = parts.sublist(4).join('-');
+
+    if (idx == null || tot == null) return AddFrameResult.rejected;
+    if (tot != total) return AddFrameResult.rejected;
+    if (frameSid != sid) return AddFrameResult.rejected;
+    if (idx < 1 || idx > total) return AddFrameResult.rejected;
+    if (data.isEmpty) return AddFrameResult.rejected;
+
+    if (_parts.containsKey(idx)) {
+      if (_parts[idx] == data) return AddFrameResult.duplicate;
+      _parts.clear();
+      _parts[idx] = data;
+      lastUpdate = DateTime.now();
+      return AddFrameResult.reset;
+    }
+
+    _parts[idx] = data;
     lastUpdate = DateTime.now();
+    return AddFrameResult.added;
   }
 
-  // چک کردن دقیق تعداد تکه‌ها
   bool get isComplete => _parts.length == total;
+  int get receivedCount => _parts.length;
 
   String assemble() {
     final sb = StringBuffer();
-    // پیدا کردن کوچکترین ایندکس (ممکن است فرستنده از 0 شروع کرده باشد یا 1)
-    int startIdx = _parts.keys.reduce((a, b) => a < b ? a : b);
-    
-    for (int i = startIdx; i < startIdx + total; i++) {
-      if (_parts.containsKey(i)) {
-        sb.write(_parts[i]);
-      }
+    for (int i = 1; i <= total; i++) {
+      sb.write(_parts[i] ?? "");
     }
     return sb.toString();
   }
