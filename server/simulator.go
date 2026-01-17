@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"sort"
@@ -21,19 +22,21 @@ import (
 )
 
 const (
-	BASE_DOMAIN = "p99.online.ir"
-	PASSPHRASE  = "my-fixed-passphrase-change-me"
-
 	MY_ID     = "simul"
 	TARGET_ID = "a3akc"
 
 	// Direct server IP for DNS queries (bypasses recursive DNS)
 	// Set to empty string "" to use system recursive DNS instead
-	DIRECT_SERVER_IP   = ""
 	DIRECT_SERVER_PORT = 53
 
 	// Fallback to A only when enabled and no response received
 	ENABLE_A_FALLBACK = false
+)
+
+var (
+	BASE_DOMAIN      string
+	PASSPHRASE       string
+	DIRECT_SERVER_IP string
 )
 
 // RX buffers: key = "sid-rid-tot" -> idx->payload
@@ -63,6 +66,60 @@ var resolver4 = &net.Resolver{
 		d := net.Dialer{Timeout: 1200 * time.Millisecond}
 		return d.DialContext(ctx, "udp4", address)
 	},
+}
+
+func init() {
+	loadDotEnv(".env")
+
+	BASE_DOMAIN = getEnvRequired("PEYK_DOMAIN")
+	PASSPHRASE = getEnvRequired("PEYK_PASSPHRASE")
+	DIRECT_SERVER_IP = getEnvOrDefault("PEYK_DIRECT_SERVER_IP", "")
+}
+
+func getEnvRequired(key string) string {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		log.Fatalf("missing required env var %s", key)
+	}
+	return val
+}
+
+func getEnvOrDefault(key, def string) string {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		return def
+	}
+	return val
+}
+
+func loadDotEnv(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimSpace(line[len("export "):])
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+		val = strings.Trim(val, "\"'")
+		if key == "" {
+			continue
+		}
+		if os.Getenv(key) == "" {
+			_ = os.Setenv(key, val)
+		}
+	}
 }
 
 func generateID() string {

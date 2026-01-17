@@ -6,6 +6,7 @@ import 'dart:math';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/notifications.dart';
+import '../core/protocol.dart';
 import '../core/rx_assembly.dart';
 import '../core/transport.dart';
 import '../core/decode_worker.dart';
@@ -54,10 +55,14 @@ class _ContactsScreenState extends State<ContactsScreen> {
   bool _pollingEnabled = true;
   bool _fallbackEnabled = false;
   bool _useDirectServer = false;
+  bool _sendViaAAAA = false;
+  bool _debugMode = false;
   int _pollMin = 20;
   int _pollMax = 40;
-  String _baseDomain = 'p99.online.ir';
-  String _serverIP = '';
+  int _retryCount = 3;
+  String _baseDomain = PeykProtocol.baseDomain;
+  String _serverIP = PeykProtocol.defaultServerIP;
+  String _locationMode = "iran";
   final Map<String, _RxBufferState> _buffers = {};
 
   static const int _contactsPollSeconds = 30;
@@ -108,6 +113,19 @@ class _ContactsScreenState extends State<ContactsScreen> {
       }
     }
     if (!mounted) return;
+    final savedLocation = prefs.getString('location_mode') ?? "";
+    String nextLocation = savedLocation;
+    final defaultServerIP = PeykProtocol.defaultServerIP;
+    if (nextLocation.isEmpty) {
+      final savedDirect = prefs.getBool('use_direct_server') ?? false;
+      final savedIP = prefs.getString('server_ip') ?? "";
+      if (savedDirect && defaultServerIP.isNotEmpty && savedIP == defaultServerIP) {
+        nextLocation = "other";
+      } else {
+        nextLocation = "iran";
+      }
+    }
+
     setState(() {
       _myId = myId;
       _contacts = contacts.where(IdUtils.isValid).toList();
@@ -115,11 +133,28 @@ class _ContactsScreenState extends State<ContactsScreen> {
       _unread = unread;
       _pollMin = prefs.getInt('poll_min') ?? 3;
       _pollMax = prefs.getInt('poll_max') ?? 10;
+      _retryCount = prefs.getInt('retry_count') ?? 3;
       _pollingEnabled = prefs.getBool('polling_enabled') ?? true;
+      _debugMode = prefs.getBool('debug_mode') ?? false;
       _fallbackEnabled = prefs.getBool('fallback_enabled') ?? true;
       _useDirectServer = prefs.getBool('use_direct_server') ?? false;
-      _baseDomain = prefs.getString('base_domain') ?? 'p99.online.ir';
-      _serverIP = prefs.getString('server_ip') ?? '';
+      _sendViaAAAA = prefs.getBool('send_via_aaaa') ?? false;
+      _baseDomain = prefs.getString('base_domain') ?? PeykProtocol.baseDomain;
+      _serverIP = prefs.getString('server_ip') ?? PeykProtocol.defaultServerIP;
+      _locationMode = nextLocation;
+
+      if (_locationMode == "iran") {
+        _useDirectServer = false;
+        _sendViaAAAA = true;
+        _fallbackEnabled = true;
+        _retryCount = 3;
+      } else if (_locationMode == "other") {
+        _useDirectServer = true;
+        _serverIP = defaultServerIP;
+        _sendViaAAAA = true;
+        _fallbackEnabled = true;
+        _retryCount = 3;
+      }
     });
     _startPolling();
   }
@@ -274,6 +309,281 @@ class _ContactsScreenState extends State<ContactsScreen> {
         ],
       ),
     );
+  }
+
+  void _showSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    final domainCtrl = TextEditingController();
+    final ipCtrl = TextEditingController();
+    final pollMinCtrl = TextEditingController();
+    final pollMaxCtrl = TextEditingController();
+    final retryCtrl = TextEditingController(text: _retryCount.toString());
+    String locationMode = _locationMode;
+
+    if (!mounted) return;
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setL) => AlertDialog(
+          backgroundColor: const Color(0xFF111B21),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20), side: BorderSide(color: const Color(0xFF00A884).withOpacity(0.3))),
+          title: const Text("SETTINGS", style: TextStyle(fontSize: 12, letterSpacing: 2, fontWeight: FontWeight.bold, color: Color(0xFF00A884))),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF111B21),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: const Color(0xFF202C33)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text("LOCATION", style: TextStyle(fontSize: 10, letterSpacing: 2, color: Color(0xFF8696A0))),
+                      const SizedBox(height: 6),
+                      DropdownButtonFormField<String>(
+                        value: locationMode,
+                        dropdownColor: const Color(0xFF202C33),
+                        decoration: InputDecoration(
+                          labelText: "Location",
+                          labelStyle: const TextStyle(color: Color(0xFF8696A0), fontSize: 12),
+                          filled: true,
+                          fillColor: const Color(0xFF202C33),
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+                        ),
+                        items: const [
+                          DropdownMenuItem(value: "iran", child: Text("Iran", style: TextStyle(color: Colors.white))),
+                          DropdownMenuItem(value: "other", child: Text("Other Countries", style: TextStyle(color: Colors.white))),
+                          DropdownMenuItem(value: "advanced", child: Text("Advanced", style: TextStyle(color: Colors.white))),
+                        ],
+                        onChanged: (value) {
+                          if (value == null) return;
+                          setL(() {
+                            locationMode = value;
+                            if (locationMode == "iran") {
+                              _useDirectServer = false;
+                              _sendViaAAAA = true;
+                              _fallbackEnabled = true;
+                            } else if (locationMode == "other") {
+                              _useDirectServer = true;
+                              _sendViaAAAA = true;
+                              _fallbackEnabled = true;
+                              ipCtrl.text = PeykProtocol.defaultServerIP;
+                            } else if (locationMode == "advanced") {
+                              ipCtrl.text = "";
+                              domainCtrl.text = "";
+                              pollMinCtrl.text = "";
+                              pollMaxCtrl.text = "";
+                            }
+                          });
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 10),
+                if (locationMode == "advanced")
+                  Container(
+                    width: double.infinity,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF111B21),
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(color: const Color(0xFF202C33)),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 8, 12, 6),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text("ADVANCED", style: TextStyle(fontSize: 10, letterSpacing: 2, color: Color(0xFF8696A0))),
+                          _buildSettingField(ipCtrl, "Relay Server IP", Icons.lan, "Custom IP"),
+                          _buildSettingField(domainCtrl, "Base Domain", Icons.dns, "Custom Domain"),
+                          SwitchListTile(
+                            contentPadding: EdgeInsets.zero,
+                            title: const Text("Use Direct Server IP", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                            value: _useDirectServer,
+                            activeColor: const Color(0xFF00A884),
+                            onChanged: (v) => setL(() => _useDirectServer = v),
+                          ),
+                          SwitchListTile(
+                            contentPadding: EdgeInsets.zero,
+                            title: const Text("Send via AAAA", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                            value: _sendViaAAAA,
+                            activeColor: const Color(0xFF00A884),
+                            onChanged: (v) => setL(() => _sendViaAAAA = v),
+                          ),
+                          Row(children: [
+                            Expanded(child: _buildSettingField(pollMinCtrl, "Min Poll", Icons.timer_outlined, "Min >= 3", isNum: true)),
+                            const SizedBox(width: 10),
+                            Expanded(child: _buildSettingField(pollMaxCtrl, "Max Poll", Icons.timer, "Max >= Min", isNum: true)),
+                          ]),
+                          _buildSettingField(retryCtrl, "Retries", Icons.repeat, ">= 1", isNum: true),
+                          SwitchListTile(
+                            contentPadding: EdgeInsets.zero,
+                            title: const Text("Active Polling", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                            value: _pollingEnabled,
+                            activeColor: const Color(0xFF00A884),
+                            onChanged: (v) => setL(() => _pollingEnabled = v),
+                          ),
+                          SwitchListTile(
+                            contentPadding: EdgeInsets.zero,
+                            title: const Text("A Fallback on No Response", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                            value: _fallbackEnabled,
+                            activeColor: const Color(0xFF00A884),
+                            onChanged: (v) => setL(() => _fallbackEnabled = v),
+                          ),
+                          SwitchListTile(
+                            contentPadding: EdgeInsets.zero,
+                            title: const Text("Debug Mode", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                            value: _debugMode,
+                            activeColor: const Color(0xFF3E7BFA),
+                            onChanged: (v) => setL(() => _debugMode = v),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text("DISCARD", style: TextStyle(color: Colors.white30))),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00A884), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
+              onPressed: () async {
+                final selectedLocation = locationMode;
+                String nextServerIP = _serverIP;
+                String nextDomain = _baseDomain;
+                bool nextUseDirect = _useDirectServer;
+                bool nextSendViaAAAA = _sendViaAAAA;
+                bool nextFallback = _fallbackEnabled;
+                int nextPollMin = _pollMin;
+                int nextPollMax = _pollMax;
+                int nextRetryCount = _retryCount;
+
+                if (selectedLocation == "iran") {
+                  nextUseDirect = false;
+                  nextSendViaAAAA = true;
+                  nextFallback = true;
+                  nextRetryCount = 3;
+                } else if (selectedLocation == "other") {
+                  nextUseDirect = true;
+                  nextServerIP = PeykProtocol.defaultServerIP;
+                  nextSendViaAAAA = true;
+                  nextFallback = true;
+                  nextRetryCount = 3;
+                } else {
+                  final nextIP = ipCtrl.text.trim();
+                  final nextBase = domainCtrl.text.trim();
+                  if (nextIP.isNotEmpty) {
+                    nextServerIP = nextIP;
+                  }
+                  if (nextBase.isNotEmpty) {
+                    nextDomain = nextBase;
+                  }
+                  final rawPollMin = int.tryParse(pollMinCtrl.text.trim());
+                  final rawPollMax = int.tryParse(pollMaxCtrl.text.trim());
+                  if (rawPollMin != null || rawPollMax != null) {
+                    final minCandidate = rawPollMin ?? _pollMin;
+                    final maxCandidate = rawPollMax ?? _pollMax;
+                    nextPollMin = max(3, minCandidate);
+                    nextPollMax = max(nextPollMin, maxCandidate);
+                  }
+                  final rawRetry = int.tryParse(retryCtrl.text.trim());
+                  if (rawRetry != null && rawRetry > 0) {
+                    nextRetryCount = rawRetry;
+                  }
+                }
+
+                await prefs.setString('location_mode', selectedLocation);
+                await prefs.setString('server_ip', nextServerIP);
+                await prefs.setString('base_domain', nextDomain);
+                await prefs.setInt('poll_min', nextPollMin);
+                await prefs.setInt('poll_max', nextPollMax);
+                await prefs.setInt('retry_count', nextRetryCount);
+                await prefs.setBool('polling_enabled', _pollingEnabled);
+                await prefs.setBool('debug_mode', _debugMode);
+                await prefs.setBool('fallback_enabled', nextFallback);
+                await prefs.setBool('use_direct_server', nextUseDirect);
+                await prefs.setBool('send_via_aaaa', nextSendViaAAAA);
+                setState(() {
+                  _pollMin = nextPollMin;
+                  _pollMax = nextPollMax;
+                  _retryCount = nextRetryCount;
+                  _serverIP = nextServerIP;
+                  _baseDomain = nextDomain;
+                  _useDirectServer = nextUseDirect;
+                  _sendViaAAAA = nextSendViaAAAA;
+                  _fallbackEnabled = nextFallback;
+                  _locationMode = selectedLocation;
+                });
+                _startPolling();
+                if (context.mounted) Navigator.pop(context);
+              },
+              child: const Text("APPLY", style: TextStyle(color: Colors.white)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSettingField(TextEditingController ctrl, String label, IconData icon, String hint, {bool isNum = false, bool enabled = true}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: TextField(
+        enabled: enabled,
+        controller: ctrl,
+        keyboardType: isNum ? TextInputType.number : TextInputType.text,
+        style: const TextStyle(fontSize: 13, color: Colors.white),
+        decoration: InputDecoration(
+          labelText: label,
+          hintText: hint,
+          prefixIcon: Icon(icon, size: 18, color: const Color(0xFF00A884)),
+          labelStyle: const TextStyle(color: Color(0xFF8696A0), fontSize: 12),
+          filled: true,
+          fillColor: const Color(0xFF202C33),
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+        ),
+      ),
+    );
+  }
+
+  Future<bool> _confirmDeleteContact(String id, String title) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: true,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF111B21),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: BorderSide(color: const Color(0xFFB00020).withOpacity(0.35)),
+        ),
+        title: const Text(
+          "DELETE CONTACT",
+          style: TextStyle(fontSize: 12, letterSpacing: 2, fontWeight: FontWeight.bold, color: Color(0xFFB00020)),
+        ),
+        content: Text(
+          "Delete $title?\nThis will remove the contact and its unread counter.",
+          style: const TextStyle(fontSize: 12, color: Colors.white70),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text("CANCEL", style: TextStyle(color: Colors.white30))),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFB00020), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text("DELETE", style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+    return confirmed ?? false;
   }
 
   Future<void> _showAbout() async {
@@ -604,6 +914,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
       appBar: AppBar(
         title: const Text("CONTACTS", style: TextStyle(letterSpacing: 3, fontSize: 12, fontWeight: FontWeight.bold)),
         actions: [
+          IconButton(icon: const Icon(Icons.settings, size: 20), onPressed: _showSettings),
           IconButton(icon: const Icon(Icons.info_outline, size: 20), onPressed: _showAbout),
           IconButton(icon: const Icon(Icons.add, size: 20), onPressed: _showAddContact),
         ],
@@ -694,69 +1005,83 @@ class _ContactsScreenState extends State<ContactsScreen> {
                           final title = displayName?.isNotEmpty == true ? displayName! : id;
                           final initials = title.isNotEmpty ? title[0].toUpperCase() : "?";
                           final unread = _unread[id] ?? 0;
-                          return Material(
-                            color: Colors.transparent,
-                            child: InkWell(
-                              borderRadius: BorderRadius.circular(14),
-                              onTap: () => _openChat(id),
-                              child: Container(
+                          return Dismissible(
+                            key: ValueKey(id),
+                            direction: DismissDirection.endToStart,
+                            confirmDismiss: (_) => _confirmDeleteContact(id, title),
+                            background: Container(
                               margin: const EdgeInsets.only(bottom: 10),
-                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                              padding: const EdgeInsets.symmetric(horizontal: 16),
                               decoration: BoxDecoration(
-                                  color: const Color(0xFF111B21),
-                                  borderRadius: BorderRadius.circular(14),
-                                  border: Border.all(color: const Color(0xFF202C33)),
-                                ),
+                                color: const Color(0xFFB00020),
+                                borderRadius: BorderRadius.circular(14),
+                              ),
+                              alignment: Alignment.centerRight,
                               child: Row(
-                                children: [
-                                  Container(
-                                    width: 36,
-                                    height: 36,
-                                    decoration: BoxDecoration(
-                                      shape: BoxShape.circle,
-                                      color: const Color(0xFF25D366),
-                                    ),
-                                    child: Center(
-                                      child: Text(initials, style: const TextStyle(color: Colors.white, fontSize: 14)),
-                                    ),
+                                mainAxisAlignment: MainAxisAlignment.end,
+                                children: const [
+                                  Icon(Icons.delete, color: Colors.white, size: 18),
+                                  SizedBox(width: 6),
+                                  Text("Delete", style: TextStyle(color: Colors.white, fontSize: 12)),
+                                ],
+                              ),
+                            ),
+                            onDismissed: (_) => _removeContact(id),
+                            child: Material(
+                              color: Colors.transparent,
+                              child: InkWell(
+                                borderRadius: BorderRadius.circular(14),
+                                onTap: () => _openChat(id),
+                                child: Container(
+                                  margin: const EdgeInsets.only(bottom: 10),
+                                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFF111B21),
+                                    borderRadius: BorderRadius.circular(14),
+                                    border: Border.all(color: const Color(0xFF202C33)),
                                   ),
-                                  const SizedBox(width: 12),
-                                  Expanded(
-                                    child: Column(
-                                      crossAxisAlignment: CrossAxisAlignment.start,
-                                      children: [
-                                        Text(title, style: const TextStyle(color: Colors.white, fontSize: 13)),
-                                        if (displayName?.isNotEmpty == true)
-                                          Text(id, style: const TextStyle(color: Color(0xFF8696A0), fontSize: 10)),
-                                      ],
-                                    ),
-                                  ),
-                                    IconButton(
-                                      icon: const Icon(Icons.edit, color: Color(0xFF8696A0), size: 18),
-                                      onPressed: () => _showEditName(id),
-                                    ),
-                                    IconButton(
-                                      icon: const Icon(Icons.delete, color: Color(0xFF8696A0), size: 18),
-                                      onPressed: () => _removeContact(id),
-                                    ),
-                                    if (unread > 0)
+                                  child: Row(
+                                    children: [
                                       Container(
-                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                        decoration: BoxDecoration(
-                                          color: const Color(0xFF00A884),
-                                          borderRadius: BorderRadius.circular(10),
+                                        width: 36,
+                                        height: 36,
+                                        decoration: const BoxDecoration(
+                                          shape: BoxShape.circle,
+                                          color: Color(0xFF25D366),
                                         ),
-                                        child: Text(
-                                          unread > 99 ? "99+" : unread.toString(),
-                                          style: const TextStyle(color: Colors.white, fontSize: 10),
+                                        child: Center(
+                                          child: Text(initials, style: const TextStyle(color: Colors.white, fontSize: 14)),
                                         ),
-                                      )
-                                    else
-                                      IconButton(
-                                        icon: const Icon(Icons.chevron_right, color: Color(0xFF00A884), size: 18),
-                                        onPressed: () => _openChat(id),
                                       ),
-                                  ],
+                                      const SizedBox(width: 12),
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment: CrossAxisAlignment.start,
+                                          children: [
+                                            Text(title, style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                            if (displayName?.isNotEmpty == true)
+                                              Text(id, style: const TextStyle(color: Color(0xFF8696A0), fontSize: 10)),
+                                          ],
+                                        ),
+                                      ),
+                                      IconButton(
+                                        icon: const Icon(Icons.edit, color: Color(0xFF8696A0), size: 18),
+                                        onPressed: () => _showEditName(id),
+                                      ),
+                                      if (unread > 0)
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                          decoration: BoxDecoration(
+                                            color: const Color(0xFF00A884),
+                                            borderRadius: BorderRadius.circular(10),
+                                          ),
+                                          child: Text(
+                                            unread > 99 ? "99+" : unread.toString(),
+                                            style: const TextStyle(color: Colors.white, fontSize: 10),
+                                          ),
+                                        ),
+                                    ],
+                                  ),
                                 ),
                               ),
                             ),

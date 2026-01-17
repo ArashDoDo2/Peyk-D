@@ -1,11 +1,11 @@
 class PeykProtocol {
-  static const String baseDomain = "p99.online.ir";
+  static const String baseDomain = String.fromEnvironment('PEYK_DOMAIN', defaultValue: '');
   
   // این پسورد باید بین فرستنده و گیرنده یکی باشد
-  static const String passphrase = "my-fixed-passphrase-change-me";
+  static const String passphrase = String.fromEnvironment('PEYK_PASSPHRASE', defaultValue: '');
   
   // آی‌پی پیش‌فرض سرور (اگر در تنظیمات ست نشده باشد)
-  static const String defaultServerIP = "188.209.155.2";
+  static const String defaultServerIP = String.fromEnvironment('PEYK_DIRECT_SERVER_IP', defaultValue: '');
 
     // DNS QTYPEs
   static const int qtypeA = 1;

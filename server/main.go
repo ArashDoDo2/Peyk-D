@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"encoding/binary"
@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,11 +14,14 @@ import (
 )
 
 const (
-	LISTEN_IP   = "0.0.0.0"
 	LISTEN_PORT = 53
-	BASE_DOMAIN = "p99.online.ir"
 
 	ACK_IP = "3.4.0.0" // server-received ACK (A)
+)
+
+var (
+	LISTEN_IP   string
+	BASE_DOMAIN string
 )
 
 // Debug knobs
@@ -206,6 +210,59 @@ func logEvent(tag, color, format string, args ...interface{}) {
 		prefix = color + tag + "\x1b[0m"
 	}
 	log.Printf(prefix+" "+format, args...)
+}
+
+func init() {
+	loadDotEnv(".env")
+
+	LISTEN_IP = getEnvOrDefault("PEYK_LISTEN_IP", "0.0.0.0")
+	BASE_DOMAIN = getEnvRequired("PEYK_DOMAIN")
+}
+
+func getEnvRequired(key string) string {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		log.Fatalf("missing required env var %s", key)
+	}
+	return val
+}
+
+func getEnvOrDefault(key, def string) string {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		return def
+	}
+	return val
+}
+
+func loadDotEnv(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimSpace(line[len("export "):])
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+		val = strings.Trim(val, "\"'")
+		if key == "" {
+			continue
+		}
+		if os.Getenv(key) == "" {
+			_ = os.Setenv(key, val)
+		}
+	}
 }
 
 // ───────────────────────── Main ─────────────────────────
@@ -433,6 +490,7 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 		storeMu.Unlock()
 		atomic.AddUint64(&statIgnored, 1)
 		logIf(ENABLE_ACK2_LOG, "drop chunk for acked message sid=%s tot=%d mid=%s from=%s", sid, tot, mid, addr.String())
+		sendAResponse(conn, addr, txID, domain, ACK_IP, qtype, qclass)
 		return
 	}
 	if messageStore[rid] == nil {

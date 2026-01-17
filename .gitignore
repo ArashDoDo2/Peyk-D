@@ -1,3 +1,4 @@
 server/peyk-d-server
 server/simulator_test.exe
 client_mobile/android/build/
+.env

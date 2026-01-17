@@ -41,7 +41,7 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateMixin {
+class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController _controller = TextEditingController();
   final FocusNode _inputFocus = FocusNode();
   final List<Map<String, dynamic>> _messages = [];
@@ -65,17 +65,18 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   bool _fallbackEnabled = false;
   bool _useDirectServer = false;
   bool _sendViaAAAA = false;
+  String _locationMode = "iran";
   int _pollMin = 20;
   int _pollMax = 40;
-  int _retryCount = 1;
+  int _retryCount = 3;
   String _debugInfo = "";
   int _txPercent = 0;
   bool _txActive = false;
   DateTime _lastTxUiUpdate = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _txInFlight = false;
+  int _txResetToken = 0;
 
   Timer? _pollTimer;
-  late AnimationController _glowCtrl;
-  late Animation<double> _glowAnim;
 
   static const Duration _bufferTtl = Duration(seconds: 90);
   static const int _historyMax = 200;
@@ -83,12 +84,16 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   static const Duration _resendMinInterval = Duration(seconds: 20);
   static const Duration _resendMaxInterval = Duration(minutes: 5);
   static const Duration _sendChunkDelay = Duration(milliseconds: 50);
+  static const Duration _pendingDeliveryTtl = Duration(hours: 12);
+  static const bool _enableResend = false;
   static const Color _accent = Color(0xFF00A884);
   static const Color _accentAlt = Color(0xFF25D366);
   static const Color _panel = Color(0xFF111B21);
   static const Color _panelAlt = Color(0xFF0B141A);
   static const Color _textDim = Color(0xFF8696A0);
   static const int _maxMessageChars = 280;
+  static const int _dnsTimeoutMsDefault = 1800;
+  static const int _dnsTimeoutMsDirect = 2000;
 
   @override
   void initState() {
@@ -104,8 +109,6 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   }
 
   void _setupAnimations() {
-    _glowCtrl = AnimationController(vsync: this, duration: const Duration(seconds: 2))..repeat(reverse: true);
-    _glowAnim = Tween<double>(begin: 0.3, end: 0.8).animate(CurvedAnimation(parent: _glowCtrl, curve: Curves.easeInOut));
   }
 
   void _setDebugInfo(String info) {
@@ -131,6 +134,41 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     }
     _lastTxUiUpdate = now;
     setState(() => _txPercent = pct.clamp(0, 100));
+  }
+
+  Map<String, dynamic>? _findMessageByTimestamp(int ts) {
+    if (ts <= 0) return null;
+    for (final msg in _messages) {
+      if (_messageTimestampMs(msg) == ts) {
+        return msg;
+      }
+    }
+    return null;
+  }
+
+  Map<String, dynamic>? _findMessageByMid(String mid) {
+    final needle = mid.toLowerCase();
+    for (final msg in _messages) {
+      final msgMid = (msg["mid"] ?? "").toString().toLowerCase();
+      if (msgMid.isNotEmpty && msgMid == needle) {
+        return msg;
+      }
+    }
+    return null;
+  }
+
+  void _resetTxStatus() {
+    final token = ++_txResetToken;
+    _txInFlight = false;
+    Future.delayed(const Duration(seconds: 2), () {
+      if (!mounted) return;
+      if (token != _txResetToken) return;
+      setState(() {
+        _status = NodeStatus.idle;
+        _txActive = false;
+        _txPercent = 0;
+      });
+    });
   }
 
   int? _currentRxPercent() {
@@ -192,6 +230,19 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
         // ignore bad names
       }
     }
+    final savedLocation = prefs.getString('location_mode') ?? "";
+    String nextLocation = savedLocation;
+    final defaultServerIP = PeykProtocol.defaultServerIP;
+    if (nextLocation.isEmpty) {
+      final savedDirect = prefs.getBool('use_direct_server') ?? false;
+      final savedIP = prefs.getString('server_ip') ?? "";
+      if (savedDirect && defaultServerIP.isNotEmpty && savedIP == defaultServerIP) {
+        nextLocation = "other";
+      } else {
+        nextLocation = "iran";
+      }
+    }
+
     setState(() {
       _myID = prefs.getString('my_id') ?? IdUtils.generateRandomID();
       _targetID = widget.targetId;
@@ -199,13 +250,27 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       _baseDomain = prefs.getString('base_domain') ?? PeykProtocol.baseDomain;
       _pollMin = prefs.getInt('poll_min') ?? 3;
       _pollMax = prefs.getInt('poll_max') ?? 10;
-      _retryCount = prefs.getInt('retry_count') ?? 1;
+      _retryCount = prefs.getInt('retry_count') ?? 3;
       _pollingEnabled = prefs.getBool('polling_enabled') ?? true;
       _debugMode = prefs.getBool('debug_mode') ?? false;
       _fallbackEnabled = prefs.getBool('fallback_enabled') ?? true;
       _useDirectServer = prefs.getBool('use_direct_server') ?? false;
       _sendViaAAAA = prefs.getBool('send_via_aaaa') ?? false;
+      _locationMode = nextLocation;
       _contactNames = names;
+
+      if (_locationMode == "iran") {
+        _useDirectServer = false;
+        _sendViaAAAA = true;
+        _fallbackEnabled = true;
+        _retryCount = 3;
+      } else if (_locationMode == "other") {
+        _useDirectServer = true;
+        _serverIP = defaultServerIP;
+        _sendViaAAAA = true;
+        _fallbackEnabled = true;
+        _retryCount = 3;
+      }
 
       if (prefs.getString('my_id') == null) prefs.setString('my_id', _myID);
     });
@@ -232,10 +297,18 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
             ..addAll(items);
         });
         _rebuildPendingDelivery();
+        _cleanupStalePending(persistHistory: true);
       }
     } catch (_) {
       // ignore bad history
     }
+  }
+
+  int _dnsTimeoutMs() {
+    if (_useDirectServer) {
+      return _dnsTimeoutMsDirect;
+    }
+    return _dnsTimeoutMsDefault;
   }
 
   Future<void> _saveHistory() async {
@@ -308,13 +381,21 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   void _sendMessage() async {
     final text = _controller.text.trim();
     if (text.isEmpty || !IdUtils.isValid(_targetID)) return;
+    if (_txInFlight) {
+      if (_debugMode) print("DEBUG: TX already in flight, ignoring new message");
+      return;
+    }
+    _txInFlight = true;
+    _txResetToken++;
     _controller.clear();
 
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
     final msg = <String, dynamic>{
       "text": text,
       "status": "sending",
       "time": _getTime(),
       "to": _targetID,
+      "ts": nowMs,
     };
     setState(() {
       _messages.insert(0, msg);
@@ -322,9 +403,9 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       _txActive = true;
       _txPercent = 0;
     });
-    await _saveHistory();
 
     try {
+      await _saveHistory();
       _setDebugInfo("TX: encrypting...");
       final encrypted = await PeykCrypto.encrypt(text);
       final b32 = base32.encode(encrypted).toLowerCase().replaceAll('=', '');
@@ -332,47 +413,75 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       _setDebugInfo("TX: sending ${chunks.length} chunks");
       final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
       final mid = IdUtils.generateRandomID();
+      final timeoutMs = _dnsTimeoutMs();
 
-      final ackKey = "${_myID.toLowerCase()}:${chunks.length}:$mid";
       msg["mid"] = mid;
       msg["chunks"] = chunks;
-      msg["deliveryKey"] = ackKey;
-      _pendingDelivery[ackKey] = 1;
-      _pendingLastSent[ackKey] = DateTime.now();
 
+      bool allAcked = true;
       for (int i = 0; i < chunks.length; i++) {
         final label = "${i + 1}-${chunks.length}-$mid-$_myID-$_targetID-${chunks[i]}";
         if (chunks.length > 6) {
           await Future.delayed(_sendChunkDelay);
         }
+        bool acked = false;
         for (int r = 0; r <= _retryCount; r++) {
-          await transport.sendOnly("$label.$_baseDomain", qtype: _sendViaAAAA ? 28 : 1);
+          Uint8List? response;
+          if (_sendViaAAAA) {
+            response = await transport.sendAndReceive("$label.$_baseDomain", qtype: 28, timeoutMs: timeoutMs);
+            if (response == null && _fallbackEnabled) {
+              response = await transport.sendAndReceive("$label.$_baseDomain", qtype: 1, timeoutMs: timeoutMs);
+            }
+          } else {
+            response = await transport.sendAndReceive("$label.$_baseDomain", qtype: 1, timeoutMs: timeoutMs);
+          }
+          if (response != null) {
+            acked = true;
+            break;
+          }
+          if (r < _retryCount) {
+            await Future.delayed(const Duration(milliseconds: 120));
+          }
+        }
+        if (!acked) {
+          allAcked = false;
+          break;
         }
         final pct = (((i + 1) * 100) / chunks.length).floor();
         _setTxPercent(pct);
       }
-      _setDebugInfo("TX: sent ${chunks.length}/${chunks.length}");
-      setState(() {
-        msg["status"] = "sent";
-        _status = NodeStatus.success;
-        _txPercent = 100;
-      });
-      await _saveHistory();
+
+      if (allAcked) {
+        final ackKey = "${_myID.toLowerCase()}:${chunks.length}:$mid";
+        msg["deliveryKey"] = ackKey;
+        _pendingDelivery[ackKey] = 1;
+        _pendingLastSent[ackKey] = DateTime.now();
+        _setDebugInfo("TX: sent ${chunks.length}/${chunks.length}");
+        setState(() {
+          msg["status"] = "sent";
+          _status = NodeStatus.success;
+          _txPercent = 100;
+        });
+        await _saveHistory();
+      } else {
+        _setDebugInfo("TX: server ack failed");
+        setState(() {
+          msg["status"] = "error";
+          _status = NodeStatus.error;
+        });
+        await _saveHistory();
+      }
     } catch (e) {
       _setDebugInfo("TX: error");
       setState(() {
+        msg["status"] = "error";
         _status = NodeStatus.error;
         _txActive = false;
       });
+      await _saveHistory();
+    } finally {
+      _resetTxStatus();
     }
-    Future.delayed(const Duration(seconds: 2), () {
-      if (!mounted) return;
-      setState(() {
-        _status = NodeStatus.idle;
-        _txActive = false;
-        _txPercent = 0;
-      });
-    });
   }
 
   List<String> _makeChunks(String data) {
@@ -428,14 +537,16 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     const int burstAttempts = 3;
     const int burstMinMs = 200;
     const int burstMaxMs = 400;
-    const int maxLoops = 6;
-    const int burstMaxLoops = 60;
-    const Duration maxBudget = Duration(seconds: 3);
-    const Duration burstBudget = Duration(seconds: 20);
+    const int maxLoops = 5;
+    const int burstMaxLoops = 40;
+    const Duration maxBudget = Duration(seconds: 5);
+    const Duration burstBudget = Duration(seconds: 12);
     final startAt = DateTime.now();
     var lastProgressAt = startAt;
     int loops = 0;
     bool burstMode = false;
+    int framesSeen = 0;
+    final timeoutMs = _dnsTimeoutMs();
 
     while (hasMore) {
       if (!_pollingEnabled) break;
@@ -458,12 +569,20 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       for (int attempt = 0; attempt < burstAttempts; attempt++) {
         // 1) Try AAAA
         final pollNonce = IdUtils.generateRandomID();
-        var response = await transport.sendAndReceive("v1.sync.$_myID.$pollNonce.$_baseDomain", qtype: 28);
+        var response = await transport.sendAndReceive(
+          "v1.sync.$_myID.$pollNonce.$_baseDomain",
+          qtype: 28,
+          timeoutMs: timeoutMs,
+        );
         usedAAAA = true;
 
         // 2) Fallback to A only if no response
         if (response == null && _fallbackEnabled) {
-          response = await transport.sendAndReceive("v1.sync.$_myID.$pollNonce.$_baseDomain", qtype: 1);
+          response = await transport.sendAndReceive(
+            "v1.sync.$_myID.$pollNonce.$_baseDomain",
+            qtype: 1,
+            timeoutMs: timeoutMs,
+          );
           usedAAAA = false;
         }
 
@@ -479,7 +598,11 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
         txt = _bytesToText(rawBytes);
 
         if ((txt.isEmpty || txt == "NOP") && usedAAAA && _fallbackEnabled) {
-          response = await transport.sendAndReceive("v1.sync.$_myID.$pollNonce.$_baseDomain", qtype: 1);
+          response = await transport.sendAndReceive(
+            "v1.sync.$_myID.$pollNonce.$_baseDomain",
+            qtype: 1,
+            timeoutMs: timeoutMs,
+          );
           usedAAAA = false;
           if (response != null) {
             rawBytes = response;
@@ -496,7 +619,11 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
 
         looksFrame = txt.startsWith("ACK2-") || '-'.allMatches(txt).length >= 4;
         if (!looksFrame && usedAAAA && _fallbackEnabled) {
-          response = await transport.sendAndReceive("v1.sync.$_myID.$pollNonce.$_baseDomain", qtype: 1);
+          response = await transport.sendAndReceive(
+            "v1.sync.$_myID.$pollNonce.$_baseDomain",
+            qtype: 1,
+            timeoutMs: timeoutMs,
+          );
           usedAAAA = false;
           if (response != null) {
             rawBytes = response;
@@ -540,7 +667,10 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       } else {
         _handleIncomingChunk(txt);
       }
-      if (!burstMode && looksFrame) {
+      if (looksFrame) {
+        framesSeen++;
+      }
+      if (!burstMode && framesSeen >= 2) {
         burstMode = true;
       }
       lastProgressAt = DateTime.now();
@@ -588,11 +718,66 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     final now = DateTime.now();
     for (final msg in _messages) {
       if (msg["status"] == "sent" && msg["deliveryKey"] != null) {
+        final tsMs = _messageTimestampMs(msg);
+        if (tsMs <= 0) {
+          continue;
+        }
+        final age = now.difference(DateTime.fromMillisecondsSinceEpoch(tsMs));
+        if (age > _pendingDeliveryTtl) {
+          continue;
+        }
         final key = msg["deliveryKey"].toString();
         _pendingDelivery[key] = 1;
         _pendingLastSent[key] = DateTime.fromMillisecondsSinceEpoch(0);
       }
     }
+  }
+
+  int _messageTimestampMs(Map<String, dynamic> msg) {
+    final ts = msg["ts"];
+    if (ts is int) return ts;
+    if (ts is num) return ts.toInt();
+    if (ts is String) return int.tryParse(ts) ?? 0;
+    return 0;
+  }
+
+  void _cleanupStalePending({bool persistHistory = false}) {
+    if (_pendingDelivery.isEmpty) return;
+    final now = DateTime.now();
+    final staleKeys = <String>[];
+
+    for (final key in _pendingDelivery.keys) {
+      Map<String, dynamic>? msg;
+      for (final m in _messages) {
+        if (m["deliveryKey"] == key) {
+          msg = m;
+          break;
+        }
+      }
+      if (msg == null) {
+        staleKeys.add(key);
+        continue;
+      }
+      final tsMs = _messageTimestampMs(msg);
+      if (tsMs <= 0) {
+        staleKeys.add(key);
+        continue;
+      }
+      final age = now.difference(DateTime.fromMillisecondsSinceEpoch(tsMs));
+      if (age > _pendingDeliveryTtl) {
+        staleKeys.add(key);
+      }
+    }
+
+    if (staleKeys.isEmpty) return;
+    for (final key in staleKeys) {
+      _pendingDelivery.remove(key);
+      _pendingLastSent.remove(key);
+    }
+    if (persistHistory) {
+      _saveHistory();
+    }
+    if (_debugMode) _setDebugInfo("TX: cleared ${staleKeys.length} stale");
   }
 
   Duration _resendBackoff(int attempt) {
@@ -604,6 +789,8 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
   }
 
   Future<void> _resendPending() async {
+    if (!_enableResend) return;
+    _cleanupStalePending();
     if (_pendingDelivery.isEmpty || !_pollingEnabled) return;
     final now = DateTime.now();
     final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
@@ -710,6 +897,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
         if (_isRecentlySeenRx(dedupKey)) {
           if (_debugMode) print("DEBUG: Dropped late chunk for delivered $dedupKey");
           _setDebugInfo("RX: late $idx/$tot");
+          await _sendAck2(sid, tot, mid);
           return;
         }
 
@@ -765,6 +953,9 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
           
           // Check if decryption actually failed (returns error message)
           if (decrypted.startsWith("Error") || decrypted.startsWith("Decryption error")) {
+            final displayError = decrypted.startsWith("Decryption error")
+                ? "Decryption error (check passphrase)"
+                : decrypted;
             if (_debugMode) print("❌ Decryption failed: $decrypted");
             if (_debugMode) print("DEBUG: Raw assembled payload was: $rawAssembled");
             final normalized = (result["normalized"] as String?) ?? "";
@@ -775,10 +966,11 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
             if (!mounted) return;
             setState(() {
               _messages.insert(0, {
-                "text": decrypted,
+                "text": displayError,
                 "status": "received",
                 "from": sid,
                 "time": _getTime(),
+                "ts": DateTime.now().millisecondsSinceEpoch,
               });
             });
             _saveHistory();
@@ -789,12 +981,14 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
           final dedupKey = _rxDedupKey(sid, mid, tot);
           final isDup = _markSeenRx(dedupKey);
           if (!isDup) {
+            final nowMs = DateTime.now().millisecondsSinceEpoch;
             if (sid != _targetID.toLowerCase()) {
               await _appendToHistoryForTarget(sid, {
                 "text": decrypted,
                 "status": "received",
                 "from": sid,
                 "time": _getTime(),
+                "ts": nowMs,
               });
               await _incrementUnread(sid);
               await NotificationService.showIncomingMessage(_displayNameForId(sid), decrypted);
@@ -805,6 +999,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                   "status": "received",
                   "from": sid,
                   "time": _getTime(),
+                  "ts": nowMs,
                 });
               });
               _saveHistory();
@@ -815,13 +1010,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
             print("DEBUG: Dropped duplicate message $dedupKey");
           }
 
-          // ACK2 (A + AAAA)
-          final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
-          final ackLabel = "ack2-$sid-$tot-$mid";
-          final ackNonceA = IdUtils.generateRandomID();
-          final ackNonceAAAA = IdUtils.generateRandomID();
-          await transport.sendOnly("$ackLabel.$ackNonceA.$_baseDomain", qtype: 1);
-          await transport.sendOnly("$ackLabel.$ackNonceAAAA.$_baseDomain", qtype: 28);
+          await _sendAck2(sid, tot, mid);
           _setDebugInfo("RX: ACK2 sent");
         } catch (e) {
           if (_debugMode) print("❌ Decryption/Base32 Error: $e");
@@ -831,6 +1020,15 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     } catch (e) {
       if (_debugMode) print("❌ Processing Error: $e");
     }
+  }
+
+  Future<void> _sendAck2(String sid, int tot, String mid) async {
+    final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
+    final ackLabel = "ack2-$sid-$tot-$mid";
+    final ackNonceA = IdUtils.generateRandomID();
+    final ackNonceAAAA = IdUtils.generateRandomID();
+    await transport.sendOnly("$ackLabel.$ackNonceA.$_baseDomain", qtype: 1);
+    await transport.sendOnly("$ackLabel.$ackNonceAAAA.$_baseDomain", qtype: 28);
   }
 
   String _getTime() => "${DateTime.now().hour}:${DateTime.now().minute.toString().padLeft(2, '0')}";
@@ -982,7 +1180,6 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
             tooltip: "Clear Chat",
             onPressed: _confirmClearHistory,
           ),
-          IconButton(icon: const Icon(Icons.settings, size: 20), onPressed: _showSettings),
         ],
       ),
       body: Stack(
@@ -1146,14 +1343,16 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
       controller: _chatScrollCtrl,
       itemCount: _messages.length,
-      itemBuilder: (context, index) => _buildMessageBubble(_messages[index]),
+      itemBuilder: (context, index) => _buildMessageBubble(_messages[index], index),
     );
   }
 
-  Widget _buildMessageBubble(Map<String, dynamic> msg) {
+  Widget _buildMessageBubble(Map<String, dynamic> msg, int index) {
     bool isRx = msg["status"] == "received";
     final textValue = (msg["text"] ?? "").toString();
     final isRtlMsg = _isRtlText(textValue);
+    final msgTs = _messageTimestampMs(msg);
+    final msgMid = (msg["mid"] ?? "").toString();
     final bubble = Container(
       margin: const EdgeInsets.symmetric(vertical: 6),
       padding: const EdgeInsets.all(12),
@@ -1191,7 +1390,16 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
             children: [
               Text(msg["time"], style: const TextStyle(color: _textDim, fontSize: 8)),
               const SizedBox(width: 4),
-              if (msg["status"] != "received") _buildStatusIcon(msg["status"]),
+              if (msg["status"] == "error")
+                IconButton(
+                  icon: const Icon(Icons.refresh, size: 14, color: Color(0xFF8696A0)),
+                  tooltip: "Retry",
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
+                  onPressed: () => _retryFailedMessageById(msgMid, msgTs),
+                )
+              else if (msg["status"] != "received")
+                _buildStatusIcon(msg["status"]),
             ],
           ),
         ],
@@ -1225,6 +1433,111 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
         return const Icon(Icons.done_all, size: 14, color: _accent);
       default:
         return const SizedBox.shrink();
+    }
+  }
+
+  Future<void> _retryFailedMessageById(String msgMid, int msgTs) async {
+    if (msgMid.isEmpty && msgTs <= 0) return;
+    if (_txInFlight) {
+      if (_debugMode) print("DEBUG: TX already in flight, waiting...");
+      return;
+    }
+    final msg = msgMid.isNotEmpty ? _findMessageByMid(msgMid) : _findMessageByTimestamp(msgTs);
+    if (msg == null) {
+      if (_debugMode) print("DEBUG: Message with mid=$msgMid ts=$msgTs not found");
+      return;
+    }
+    if (msg["status"] != "error") return;
+
+    _txInFlight = true;
+    _txResetToken++;
+    setState(() {
+      msg["status"] = "sending";
+      _status = NodeStatus.sending;
+      _txActive = true;
+      _txPercent = 0;
+    });
+
+    try {
+      await _saveHistory();
+      _setDebugInfo("TX: retrying...");
+      final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
+      final text = (msg["text"] ?? "").toString();
+      var mid = (msg["mid"] ?? "").toString();
+      List<dynamic>? chunks = msg["chunks"] is List ? (msg["chunks"] as List) : null;
+      final timeoutMs = _dnsTimeoutMs();
+
+      if (mid.isEmpty || chunks == null || chunks.isEmpty) {
+        final encrypted = await PeykCrypto.encrypt(text);
+        final b32 = base32.encode(encrypted).toLowerCase().replaceAll('=', '');
+        final newChunks = _makeChunks(b32);
+        mid = IdUtils.generateRandomID();
+        msg["mid"] = mid;
+        msg["chunks"] = newChunks;
+        chunks = newChunks;
+      }
+
+      bool allAcked = true;
+      for (int i = 0; i < chunks.length; i++) {
+        final chunk = chunks[i].toString();
+        final label = "${i + 1}-${chunks.length}-$mid-$_myID-$_targetID-$chunk";
+        if (chunks.length > 6) {
+          await Future.delayed(_sendChunkDelay);
+        }
+        bool acked = false;
+        for (int r = 0; r <= _retryCount; r++) {
+          Uint8List? response;
+          if (_sendViaAAAA) {
+            response = await transport.sendAndReceive("$label.$_baseDomain", qtype: 28, timeoutMs: timeoutMs);
+            if (response == null && _fallbackEnabled) {
+              response = await transport.sendAndReceive("$label.$_baseDomain", qtype: 1, timeoutMs: timeoutMs);
+            }
+          } else {
+            response = await transport.sendAndReceive("$label.$_baseDomain", qtype: 1, timeoutMs: timeoutMs);
+          }
+          if (response != null) {
+            acked = true;
+            break;
+          }
+          if (r < _retryCount) {
+            await Future.delayed(const Duration(milliseconds: 120));
+          }
+        }
+        if (!acked) {
+          allAcked = false;
+          break;
+        }
+        final pct = (((i + 1) * 100) / chunks.length).floor();
+        _setTxPercent(pct);
+      }
+
+      if (allAcked) {
+        final ackKey = "${_myID.toLowerCase()}:${chunks.length}:$mid";
+        msg["deliveryKey"] = ackKey;
+        _pendingDelivery[ackKey] = 1;
+        _pendingLastSent[ackKey] = DateTime.now();
+        setState(() {
+          msg["status"] = "sent";
+          _status = NodeStatus.success;
+          _txPercent = 100;
+        });
+        await _saveHistory();
+      } else {
+        setState(() {
+          msg["status"] = "error";
+          _status = NodeStatus.error;
+        });
+        await _saveHistory();
+      }
+    } catch (_) {
+      setState(() {
+        msg["status"] = "error";
+        _status = NodeStatus.error;
+        _txActive = false;
+      });
+      await _saveHistory();
+    } finally {
+      _resetTxStatus();
     }
   }
 
@@ -1262,7 +1575,7 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
                         textAlign: inputRtl ? TextAlign.right : TextAlign.left,
                         style: const TextStyle(fontSize: 14, color: Colors.white),
                         decoration: InputDecoration(
-                          hintText: _targetID.isEmpty ? "Set Target in Settings" : "Message to $_targetID...",
+                          hintText: "Message...",
                           hintStyle: const TextStyle(color: _textDim),
                           filled: true,
                           fillColor: const Color(0xFF202C33),
@@ -1314,204 +1627,9 @@ class _ChatScreenState extends State<ChatScreen> with SingleTickerProviderStateM
     );
   }
 
-  void _showSettings() async {
-    final prefs = await SharedPreferences.getInstance();
-    final domainCtrl = TextEditingController(text: _baseDomain);
-    final targetCtrl = TextEditingController(text: _targetID);
-    final ipCtrl = TextEditingController(text: _serverIP);
-    final pollMinCtrl = TextEditingController(text: _pollMin.toString());
-    final pollMaxCtrl = TextEditingController(text: _pollMax.toString());
-    final retryCtrl = TextEditingController(text: _retryCount.toString());
-    bool advancedOpen = false;
-
-    if (!mounted) return;
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => StatefulBuilder(
-        builder: (context, setL) => AlertDialog(
-          backgroundColor: const Color(0xFF111B21),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20), side: BorderSide(color: _accent.withOpacity(0.3))),
-          title: const Text("NODE CONFIGURATION", style: TextStyle(fontSize: 12, letterSpacing: 2, fontWeight: FontWeight.bold, color: _accent)),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                AnimatedBuilder(
-                  animation: _glowAnim,
-                  builder: (context, _) => Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(16),
-                    decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.4),
-                      borderRadius: BorderRadius.circular(15),
-                      border: Border.all(color: _accent.withOpacity(_glowAnim.value)),
-                      boxShadow: [BoxShadow(color: _accent.withOpacity(_glowAnim.value * 0.3), blurRadius: 15, spreadRadius: 1)],
-                    ),
-                    child: Column(
-                      children: [
-                        const Text("YOUR UNIQUE ADDRESS", style: TextStyle(fontSize: 8, color: Colors.white38)),
-                        const SizedBox(height: 8),
-                        SelectableText(_myID, style: const TextStyle(fontSize: 22, letterSpacing: 4, fontFamily: 'monospace', color: Colors.white)),
-                      ],
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 15),
-                const Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.code, size: 10, color: Colors.white24),
-                    SizedBox(width: 5),
-                    Text("Arash, MEL - Jan2026", style: TextStyle(fontSize: 10, fontFamily: 'monospace', color: Colors.white54)),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF111B21),
-                    borderRadius: BorderRadius.circular(14),
-                    border: Border.all(color: const Color(0xFF202C33)),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text("CONNECTION", style: TextStyle(fontSize: 10, letterSpacing: 2, color: _textDim)),
-                      const SizedBox(height: 6),
-                      _buildSettingField(targetCtrl, "Target Node ID", Icons.person_pin, "abcde", enabled: false),
-                      _buildSettingField(ipCtrl, "Relay Server IP", Icons.lan, "1.2.3.4", enabled: _useDirectServer),
-                      _buildSettingField(domainCtrl, "Base Domain", Icons.dns, "p99.peyk-d.ir"),
-                      SwitchListTile(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text("Use Direct Server IP", style: TextStyle(fontSize: 12, color: Colors.white70)),
-                        value: _useDirectServer,
-                        activeColor: _accent,
-                        onChanged: (v) => setL(() => _useDirectServer = v),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 10),
-                Container(
-                  width: double.infinity,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF111B21),
-                    borderRadius: BorderRadius.circular(14),
-                    border: Border.all(color: const Color(0xFF202C33)),
-                  ),
-                  child: ExpansionTile(
-                    initiallyExpanded: advancedOpen,
-                    onExpansionChanged: (v) => setL(() => advancedOpen = v),
-                    iconColor: _accent,
-                    collapsedIconColor: _accent,
-                    title: const Text("ADVANCED", style: TextStyle(fontSize: 10, letterSpacing: 2, color: _textDim)),
-                    childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
-                    children: [
-                      SwitchListTile(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text("Send via AAAA", style: TextStyle(fontSize: 12, color: Colors.white70)),
-                        value: _sendViaAAAA,
-                        activeColor: _accent,
-                        onChanged: (v) => setL(() => _sendViaAAAA = v),
-                      ),
-                      Row(children: [
-                        Expanded(child: _buildSettingField(pollMinCtrl, "Min Poll", Icons.timer_outlined, "3", isNum: true)),
-                        const SizedBox(width: 10),
-                        Expanded(child: _buildSettingField(pollMaxCtrl, "Max Poll", Icons.timer, "10", isNum: true)),
-                      ]),
-                      _buildSettingField(retryCtrl, "Retries", Icons.repeat, "1", isNum: true),
-                      SwitchListTile(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text("Active Polling", style: TextStyle(fontSize: 12, color: Colors.white70)),
-                        value: _pollingEnabled,
-                        activeColor: _accent,
-                        onChanged: (v) => setL(() => _pollingEnabled = v),
-                      ),
-                      SwitchListTile(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text("A Fallback on No Response", style: TextStyle(fontSize: 12, color: Colors.white70)),
-                        value: _fallbackEnabled,
-                        activeColor: _accent,
-                        onChanged: (v) => setL(() => _fallbackEnabled = v),
-                      ),
-                      SwitchListTile(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text("Debug Mode", style: TextStyle(fontSize: 12, color: Colors.white70)),
-                        value: _debugMode,
-                        activeColor: _accentAlt,
-                        onChanged: (v) => setL(() => _debugMode = v),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(onPressed: _confirmClearHistory, child: const Text("CLEAR CHAT", style: TextStyle(color: _accentAlt))),
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text("DISCARD", style: TextStyle(color: Colors.white30))),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(backgroundColor: _accent, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
-              onPressed: () async {
-                await prefs.setString('target_id', targetCtrl.text.trim());
-                await prefs.setString('server_ip', ipCtrl.text.trim());
-                await prefs.setString('base_domain', domainCtrl.text.trim());
-                final rawPollMin = int.tryParse(pollMinCtrl.text) ?? 3;
-                final rawPollMax = int.tryParse(pollMaxCtrl.text) ?? 10;
-                final nextPollMin = max(3, rawPollMin);
-                final nextPollMax = max(nextPollMin, rawPollMax);
-                await prefs.setInt('poll_min', nextPollMin);
-                await prefs.setInt('poll_max', nextPollMax);
-                await prefs.setInt('retry_count', int.tryParse(retryCtrl.text) ?? 1);
-                await prefs.setBool('polling_enabled', _pollingEnabled);
-                await prefs.setBool('debug_mode', _debugMode);
-                await prefs.setBool('fallback_enabled', _fallbackEnabled);
-                await prefs.setBool('use_direct_server', _useDirectServer);
-                await prefs.setBool('send_via_aaaa', _sendViaAAAA);
-                setState(() {
-                  _pollMin = nextPollMin;
-                  _pollMax = nextPollMax;
-                });
-                _startPolling();
-                _loadSettings();
-                if (context.mounted) Navigator.pop(context);
-              },
-              child: const Text("APPLY", style: TextStyle(color: Colors.white)),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildSettingField(TextEditingController ctrl, String label, IconData icon, String hint, {bool isNum = false, bool enabled = true}) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      child: TextField(
-        enabled: enabled,
-        controller: ctrl,
-        keyboardType: isNum ? TextInputType.number : TextInputType.text,
-        style: const TextStyle(fontSize: 13),
-        decoration: InputDecoration(
-          labelText: label,
-          hintText: hint,
-          prefixIcon: Icon(icon, size: 18, color: _accent),
-          labelStyle: const TextStyle(color: _textDim, fontSize: 12),
-          filled: true,
-          fillColor: const Color(0xFF202C33),
-          border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
-        ),
-      ),
-    );
-  }
-
   @override
   void dispose() {
     _pollTimer?.cancel();
-    _glowCtrl.dispose();
     _inputFocus.dispose();
     _controller.dispose();
     _chatScrollCtrl.dispose();

@@ -1,0 +1,7 @@
+﻿{
+  "dart.flutterAdditionalArgs": [
+    "--dart-define=PEYK_DOMAIN=p99.online.ir",
+    "--dart-define=PEYK_PASSPHRASE=my-fixed-passphrase-change-me",
+    "--dart-define=PEYK_DIRECT_SERVER_IP=188.209.155.2"
+  ]
+}

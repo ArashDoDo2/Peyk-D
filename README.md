@@ -585,4 +585,379 @@ Inspired by constraints and principles of resilient communication systems.
 
 ---
 
+## 🔍 Code Architecture Analysis
+
+### 3-Tier System Deep Dive
+
+**Server (Go, 984 lines)**
+- Listens on UDP/53, stores message chunks in nested map: `messageStore[receiverID][messageKey][chunks]`
+- **Memory Model**: 3-level hierarchy with atomic stats counters for monitoring
+  - Level 1: receiver ID (rid)
+  - Level 2: message key (`sid:mid:tot`)
+  - Level 3: chunk envelopes (idx, tot, sid, mid, rid, payload, addedAt)
+- **GC Pattern**: Runs every 20s, expires chunks at 24h TTL, cleans orphaned keys/cursors
+- **Polling Protocol**: 
+  - Client sends: `v1.sync.<myID>.<nonce>.<domain>` (AAAA preferred, A fallback)
+  - Server responds with: chunked payloads via indexed AAAA/A RRs OR ACK2 confirmations OR "NOP"
+- **Resend Logic**: Adaptive backoff with jitter; tracks send count per message
+- **Delivery Confirmation**: ACK2 format `ack2-<sid>-<tot>-<mid>` triggers message cleanup
+
+**Client (Flutter, 1521 lines)**
+- Single-screen chat UI with per-conversation history isolation
+- **State Management**: 
+  - `_messages` list (per target, 200-message cap)
+  - `_buffers` map for frame assembly per (sid:mid:tot)
+  - `_pendingDelivery` tracking send status + retry timing
+- **Polling Loop**: 
+  - Adaptive jitter: `pollMin + random(0, pollMax-pollMin)`
+  - Burst mode when data received (up to 6 loops × 3 attempts = 18 queries)
+  - Graceful backoff when idle
+- **Frame Assembly**: Stateless `RxAssembly` per (sid, tot) pair detects duplicates/resets
+- **Deduplication**: Content-hash based (SHA256 of full B32 payload) with 10-minute TTL
+- **UI Features**: 
+  - Progress bars (TX% and RX%)
+  - Contact name mapping + unread counts
+  - Debug mode with detailed logs
+  - Settings panel with 12+ configuration options
+
+**Simulator (Go, 731 lines)**
+- Reference implementation for testing crypto/DNS outside Flutter runtime
+- **Modes**: Direct UDP (raw socket) vs Recursive DNS (OS resolver)
+- **Polling**: Adaptive backoff (1.5s → 5s, 1.5x multiplier)
+- **Latency Metrics**: Tracks TX start → ACK2 received time
+- **Content-Hash Dedup**: Same as client, prevents duplicate message processing
+
+---
+
+## ⚠️ Critical Security Findings
+
+### 1. **Hardcoded Passphrase Risk** 🔴
+**Issue**: Base domain and passphrase are hardcoded in source:
+```go
+const BASE_DOMAIN = "example.com"
+const PASSPHRASE = "strong-secret-here"
+```
+**Impact**: Source code exposure = instant compromise. Any attacker with code access can decrypt all messages.
+
+**Recommendations**:
+- ✅ **For Production**: Load from environment variables
+  ```bash
+  export PEYK_DOMAIN="yourdomain.ir"
+  export PEYK_PASSPHRASE=$(openssl rand -base64 24)
+  ```
+- ✅ **For Client**: Use secure storage (already using `flutter_secure_storage` for some configs)
+- ✅ **For Deployment**: Never commit `.env` or secrets to git; use secrets management
+
+---
+
+### 2. **Metadata Leakage** 🟡
+**Issue**: DNS queries reveal timing and frequency patterns:
+- Query timestamps → activity patterns
+- Query size → message length
+- Sender/receiver IDs → communication graph
+- Base domain → infrastructure identity
+
+**Impact**: Advanced network analysis can infer communication patterns without reading content.
+
+**Mitigations**:
+- Add dummy/noise queries to obscure patterns
+- Randomize polling intervals more aggressively
+- Use domain rotation (multiple authoritative domains)
+- Recommend VPN/proxy for sensitive use cases
+
+---
+
+### 3. **Replay Attack Vulnerability** 🟡
+**Issue**: ACK2 format includes (sid, tot, mid) but not:
+- Timestamp/nonce for ACK2 itself
+- Sequence number for message ordering
+
+**Risk**: Attacker could resend old ACK2s to prematurely stop server resends.
+
+**Recommended Fix**:
+```go
+// Current: ACK2-sid-tot-mid
+// Better: ACK2-sid-tot-mid-acknonce
+// where acknonce = first 16 bits of message hash
+
+ackNonce := fmt.Sprintf("%04x", uint16(crc32.ChecksumIEEE([]byte(key))))
+ackKey := fmt.Sprintf("ACK2-%s-%d-%s-%s", sid, tot, mid, ackNonce)
+```
+
+---
+
+### 4. **No Authentication Between Clients** 🔴
+**Issue**: Any client knowing receiver ID can send messages (no sender verification).
+
+**Scenario**: Attacker sends fake messages impersonating legitimate sender.
+
+**Recommended Fix**:
+- Optional HMAC-SHA256(message || passphrase) appended to payload
+- Verify on receive before displaying
+- Warn if HMAC is missing/invalid
+
+---
+
+### 5. **Message Size Overflow Risk** 🟡
+**Issue**: No hard limit on plaintext message size before encryption.
+
+**Risk**: 
+- Large messages → many chunks → server storage explosion
+- Denial-of-service: fill server memory with large messages
+
+**Current Mitigation**: 480-byte cap on DNS payload, but occurs **after** chunking.
+
+**Better Approach**:
+```dart
+static const int MAX_PLAINTEXT_BYTES = 10000;  // ~100 chunks max
+
+void _sendMessage() {
+  if (_controller.text.length > MAX_PLAINTEXT_CHARS) {
+    _showError('Message too long!');
+    return;
+  }
+  // ... encrypt ...
+}
+```
+
+---
+
+### 6. **DNS Amplification Attack Risk** 🔴
+**Issue**: Server responds with multiple AAAA/A records, amplifying response size.
+
+**Impact**: If attacker spoofs source IP, server becomes DNS amplifier for DDoS.
+
+**Recommended Fix**:
+```go
+// Rate limit per source IP
+const RATE_LIMIT_PER_IP = 100 // queries/sec
+var ipCounters = make(map[string]*RateLimiter)
+
+func handlePacket(...) {
+  ip := addr.IP.String()
+  if !checkRateLimit(ip) {
+    return // drop query
+  }
+  // ... process ...
+}
+```
+
+---
+
+### 7. **Memory DoS: Unbounded Goroutines** 🟡
+**Issue**: Each UDP packet spawns new goroutine:
+```go
+go handlePacket(conn, remoteAddr, pkt)  // Unbounded!
+```
+
+**Risk**: Attacker sends thousands of malformed packets → goroutine pool exhaustion.
+
+**Recommended Fix**:
+```go
+sem := make(chan struct{}, 1000)  // Limit to 1000 concurrent handlers
+
+for {
+  // ...
+  sem <- struct{}{}  // acquire
+  go func() {
+    defer func() { <-sem }()  // release
+    handlePacket(conn, remoteAddr, pkt)
+  }()
+}
+```
+
+---
+
+### 8. **Frame Injection via Message ID Collision** 🟡
+**Issue**: Message ID (mid) is just 5-char random string (32^5 = 33M combinations).
+
+**Risk**: Two different users could generate same mid → frames merge in server store.
+
+**Impact**: Low probability but catastrophic if occurs (message corruption/leak).
+
+**Recommended Fix**:
+```go
+// Use 8-char mid instead of 5-char
+mid = generateID(8)  // 32^8 = 1T combinations
+```
+
+---
+
+### 9. **No Congestion Control** 🟡
+**Issue**: Client can fire unlimited chunks without waiting for ACKs.
+
+**Risk**: Network congestion, packet loss, server overwhelm.
+
+**Better Pattern** (already partially implemented):
+```dart
+// Good: respects _sendChunkDelay for large messages
+if (chunks.length > 6) {
+  await Future.delayed(_sendChunkDelay);  // 50ms between chunks
+}
+
+// Better: add adaptive throttling
+if (_pendingDelivery.length > 3) {
+  // Too many unacked messages, slow down
+  await Future.delayed(Duration(seconds: 5));
+}
+```
+
+---
+
+### 10. **No Timestamp Validation** 🟡
+**Issue**: Messages accepted regardless of age.
+
+**Risk**: Old captured packets could be replayed hours/days later.
+
+**Recommended Fix**:
+```go
+const MESSAGE_MAX_AGE = 30 * time.Minute
+
+func handleInboundOrAck2(...) {
+  // Add client nonce (timestamp) to frame:
+  // idx-tot-mid-sid-rid-ts-payload
+  ts := atoiSafe(labels[5])
+  age := time.Since(time.Unix(0, int64(ts)*time.Millisecond.Nanoseconds()))
+  if age > MESSAGE_MAX_AGE {
+    return  // reject
+  }
+  // ... process ...
+}
+```
+
+---
+
+## 🚀 Performance & Optimization Improvements
+
+### 1. **Message Reassembly Optimization**
+**Current**: Searches array linearly for missing chunks
+```dart
+for (int i = 1; i <= total; i++) {
+  if (!chunks.containsKey(i)) return;  // ✓ Good
+}
+```
+**Status**: ✅ Already optimized with hash map
+
+---
+
+### 2. **Polling Burst Mode** ✅
+**Already Implemented**: Detects incoming data → rapid polling (burst mode)
+- Fast delay: 200-400ms between queries
+- Max 60 loops × 3 attempts within 20s budget
+- Avoids jamming network while staying responsive
+
+---
+
+### 3. **Server GC Efficiency**
+**Current**: O(n) iteration over all receivers every 20s
+```go
+for rid, msgs := range messageStore {  // Could be thousands
+  for key, chunks := range msgs {
+    // ... check TTL ...
+  }
+}
+```
+
+**Optimization**: Use timestamp indexes
+```go
+type TTLIndex struct {
+  expiresAt time.Time
+  rid       string
+  key       string
+}
+var ttlHeap []TTLIndex  // Min-heap by expiresAt
+// GC touches only expired items, not all
+```
+
+---
+
+### 4. **Deduplication Improvement**
+**Current**: Per-sender content hash with 10-min TTL
+**Issue**: Hash collisions possible (though rare) for very similar messages
+
+**Better**: Add (sender, content-hash) pair:
+```go
+dupKey := fmt.Sprintf("%s:%s:%s", sender, mid, contentHash)
+```
+
+---
+
+### 5. **Base32 Encoding Overhead**
+**Current**: ~33% overhead (8→6 characters per 5 bytes)
+```
+plaintext: 1500 bytes
+encrypted: 1500 + 12(nonce) + 16(mac) = 1528 bytes
+base32:    1528 × 8/5 = 2445 characters
+```
+
+**Alternative**: Use Base32Hex or Base36 (saves ~10%)
+- Not applicable here (DNS labels require specific charset)
+- Current approach is optimal for DNS constraints
+
+---
+
+### 6. **Frame Assembly State Cleanup**
+**Current**: Buffers with old frames kept until TTL (90s)
+```dart
+static const Duration _bufferTtl = Duration(seconds: 90);
+```
+
+**Risk**: Many partial messages → memory growth
+
+**Improvement**: 
+```dart
+void _gcBuffers() {
+  final now = DateTime.now();
+  _buffers.removeWhere((key, state) => 
+    now.difference(state.lastUpdatedAt) > _bufferTtl
+  );
+}
+```
+✅ **Already implemented** at line in `_fetchBuffer()`
+
+---
+
+## 📊 Codebase Quality Metrics
+
+| Metric | Value | Status |
+|--------|-------|--------|
+| **Server GoLang** | 984 lines | Well-organized, clear separation |
+| **Client Flutter** | 1521 lines | Feature-rich, good state management |
+| **Simulator** | 731 lines | Useful reference, well-documented |
+| **Test Coverage** | ~0% | ⚠️ No automated tests |
+| **Error Handling** | Partial | Most ops have try-catch, some silent failures |
+| **Documentation** | Good | Clear comments, protocol specs documented |
+| **Security Audit** | 10 issues | Mostly medium severity, 1-2 critical |
+| **Performance Bottlenecks** | Low | Adaptive polling good, GC efficient |
+
+---
+
+## 🛠️ Recommended Actions (Priority Order)
+
+### 🔴 **Critical** (Do Now)
+1. **Move passphrase to environment variables** (all three: server, client, simulator)
+2. **Add rate limiting per source IP** (prevent DNS amplification)
+3. **Add sender authentication** (HMAC-based message validation)
+4. **Add semaphore for goroutines** (prevent memory DoS)
+
+### 🟡 **High** (This Sprint)
+1. **Add timestamp validation** to prevent old message replays
+2. **Increase message ID from 5 to 8 characters** (collision resistance)
+3. **Add ACK2 nonce** to prevent ACK2 replay
+4. **Document threat model** with assumptions and limitations
+
+### 🟢 **Medium** (Next Sprint)
+1. **Add message size limits** (MAX_PLAINTEXT_BYTES)
+2. **Add automated tests** (unit + integration)
+3. **Implement domain rotation** support (multi-domain failover)
+4. **Add metrics/observability** (Prometheus endpoint optional)
+
+### 💡 **Nice to Have**
+1. **Implement message ordering** (sequence numbers)
+2. **Add message expiration** (client-side TTL)
+3. **Support message editing/deletion** (tombstones)
+4. **Add contact verification** (fingerprint exchange)
+
+---
+
 **Stay connected, even when the internet isn't.** 🌍
