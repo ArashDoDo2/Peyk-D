@@ -1,24 +1,47 @@
-# Peyk-D | Secure DNS Tunneling Client
+# Peyk-D Mobile Client
 
-Peyk-D is an emergency communication tool designed to bypass network restrictions by tunneling encrypted data over DNS queries (RFC 1035).
+Flutter-based chat UI for the Peyk-D protocol. It handles encryption, chunking, polling, and displays delivery status.
 
-## ✨ Features
-- **AES-GCM 256-bit Encryption**: End-to-end security for every packet.
-- **Dynamic Configuration**: Change Server IP, Base Domain, and Encryption Keys on the fly.
-- **Visual Feedback**: Real-time transmission logs with smart status coloring.
-- **Low Footprint**: Optimized for high-latency and restricted environments.
-- **Modern UI**: Clean, Dark-themed interface with "Emergency Mode" branding.
+## Features
 
-## 🛠 Tech Stack
-- **Flutter/Dart**: Cross-platform mobile client.
-- **Cryptography**: AES-GCM implementation for secure handshakes.
-- **UDP/DNS**: Raw socket programming for data exfiltration.
+- **Chat per ID**: Each `ChatScreen(targetId: "abcde")` keeps isolated history.  
+- **Direct modes**:  
+  - `Other Countries (Slow)` → Direct UDP to server.  
+  - `Other Countries (Fast)` → Direct DNS-over-TCP (use TCP for faster ACKs).  
+  - `Advanced` → Custom IP/domain/polling with legacy fallback.  
+- **Adaptive polling**: 20-40 seconds default, bursts to ~200ms when data arrives.  
+- **Retry safety**: `_txInFlight` flag avoids parallel send/retry collisions.  
+- **Settings persist**: SharedPreferences stores server IP, base domain, direct flags, stats.
 
-## 🚀 Quick Start
-1. **Clone the repo:** `git clone https://github.com/arashdodo2/peyk-d/client-mobile`
-2. **Install dependencies:** `flutter pub get`
-3. **Build APK:** `flutter build apk --split-per-abi`
-4. **Setup:** Open the app, go to Settings, and point to your Peyk-D Go Server.
+## Setup
 
-## ⚠️ Disclaimer
-This project is for educational and emergency communication purposes only. Always comply with local regulations regarding data transmission.
+```bash
+cd client_mobile
+flutter pub get
+flutter run -d <device>
+```
+
+Change `client_mobile/lib/core/protocol.dart` for base domain and default server IP. Use Settings to toggle `Direct TCP (Fast)` and `Send via AAAA`.
+
+## Diagnostics
+
+- Enable Debug mode to see frame assembly logs.  
+- Stats line reports `TX` percent, `RX` percent, and status.  
+- `Other Countries (Fast)` enables `DnsTransport(useTcp: true)` for all DNS queries and ACKs.
+
+## Testing
+
+Pair with `server/simulator.go`:
+
+```bash
+# terminal 1
+cd server
+go run simulator.go
+
+# terminal 2
+cd client_mobile
+flutter run
+
+# send messages between simulator and mobile client
+```
+
