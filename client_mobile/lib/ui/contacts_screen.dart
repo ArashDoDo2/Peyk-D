@@ -31,8 +31,11 @@ class _ContactsScreenState extends State<ContactsScreen> {
   static const String _contactsKey = 'contacts_list';
   static const String _contactNamesKey = 'contacts_names';
   static const String _unreadKey = 'contacts_unread';
-  static const String _changelogV1 = """
-CHANGELOG - Version 1.1
+static const String _changelogV1 = """
+CHANGELOG - Version 1.2
+2026-01-17 17:00 - v1.2 - Server/Client now expose UDP+TCP counters in the stats banner
+2026-01-17 17:00 - v1.2 - Added Other Countries (Fast) TCP mode + safe retry logging next to ticks
+2026-01-17 17:00 - v1.2 - Server listens on TCP 53 (in addition to UDP) and tracks ACK2 over TCP
 2026-01-17 12:00 - v1.1 - TX retry button + safe retry by mid/ts
 2026-01-17 12:00 - v1.1 - ACK2 resend for late chunks
 2026-01-17 12:00 - v1.1 - DNS timeout tuned for 350-400ms RTT

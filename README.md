@@ -98,8 +98,11 @@ Selecting “Other Countries (Fast)” toggles both `use_direct_server` and `dir
 
 ## Release notes
 
-* `v1.2` (Jan 2026): Added direct TCP mode, UDP/TCP stats bar, fast/slow settings, and refreshed docs.  
-* `v1.1` (Jan 2026): Added TCP direct mode, stats bar, enhanced settings.  
-* `v1.0`: Initial UDP-only emergency messenger with ACK2 delivery. 
+* `v1.2` (Jan 2026) – **Client & Server sync**  
+  - Server now listens on UDP/TCP 53, exposes UDP/TCP stats (stats bar + log line), and supports direct TCP polls.  
+  - Client adds “Other Countries (Fast)” mode (direct TCP) alongside “Slow” mode, exposes TCP count in stats line, and logs retries safely next to check marks.  
+  - Documentation refreshed (README, guides, security policy, contributing) to reflect the new transport modes and monitoring options.  
+* `v1.1` (Jan 2026) – Enhanced polling/ACK2 flow (poll jitter, delivery status, stats).  
+* `v1.0` – Initial UDP-only emergency messenger with ACK2 delivery.
 
 ---
