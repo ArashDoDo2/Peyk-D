@@ -98,7 +98,8 @@ Selecting “Other Countries (Fast)” toggles both `use_direct_server` and `dir
 
 ## Release notes
 
+* `v1.2` (Jan 2026): Added direct TCP mode, UDP/TCP stats bar, fast/slow settings, and refreshed docs.  
 * `v1.1` (Jan 2026): Added TCP direct mode, stats bar, enhanced settings.  
-* `v1.0`: Initial UDP-only emergency messenger with ACK2 delivery.
+* `v1.0`: Initial UDP-only emergency messenger with ACK2 delivery. 
 
 ---
