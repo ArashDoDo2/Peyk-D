@@ -64,6 +64,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _debugMode = false;
   bool _fallbackEnabled = false;
   bool _useDirectServer = false;
+  bool _directTcp = false;
   bool _sendViaAAAA = false;
   String _locationMode = "iran";
   int _pollMin = 20;
@@ -235,9 +236,10 @@ class _ChatScreenState extends State<ChatScreen> {
     final defaultServerIP = PeykProtocol.defaultServerIP;
     if (nextLocation.isEmpty) {
       final savedDirect = prefs.getBool('use_direct_server') ?? false;
+      final savedDirectTcp = prefs.getBool('direct_tcp') ?? false;
       final savedIP = prefs.getString('server_ip') ?? "";
       if (savedDirect && defaultServerIP.isNotEmpty && savedIP == defaultServerIP) {
-        nextLocation = "other";
+        nextLocation = savedDirectTcp ? "other_direct" : "other";
       } else {
         nextLocation = "iran";
       }
@@ -255,17 +257,27 @@ class _ChatScreenState extends State<ChatScreen> {
       _debugMode = prefs.getBool('debug_mode') ?? false;
       _fallbackEnabled = prefs.getBool('fallback_enabled') ?? true;
       _useDirectServer = prefs.getBool('use_direct_server') ?? false;
+      _directTcp = prefs.getBool('direct_tcp') ?? false;
       _sendViaAAAA = prefs.getBool('send_via_aaaa') ?? false;
       _locationMode = nextLocation;
       _contactNames = names;
 
       if (_locationMode == "iran") {
         _useDirectServer = false;
+        _directTcp = false;
         _sendViaAAAA = true;
         _fallbackEnabled = true;
         _retryCount = 3;
       } else if (_locationMode == "other") {
         _useDirectServer = true;
+        _directTcp = false;
+        _serverIP = defaultServerIP;
+        _sendViaAAAA = true;
+        _fallbackEnabled = true;
+        _retryCount = 3;
+      } else if (_locationMode == "other_direct") {
+        _useDirectServer = true;
+        _directTcp = true;
         _serverIP = defaultServerIP;
         _sendViaAAAA = true;
         _fallbackEnabled = true;
@@ -411,7 +423,7 @@ class _ChatScreenState extends State<ChatScreen> {
       final b32 = base32.encode(encrypted).toLowerCase().replaceAll('=', '');
       final chunks = _makeChunks(b32);
       _setDebugInfo("TX: sending ${chunks.length} chunks");
-      final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
+      final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null, useTcp: _directTcp);
       final mid = IdUtils.generateRandomID();
       final timeoutMs = _dnsTimeoutMs();
 
@@ -532,7 +544,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     _gcBuffers();
 
-    final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
+    final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null, useTcp: _directTcp);
     bool hasMore = true;
     const int burstAttempts = 3;
     const int burstMinMs = 200;
@@ -793,7 +805,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _cleanupStalePending();
     if (_pendingDelivery.isEmpty || !_pollingEnabled) return;
     final now = DateTime.now();
-    final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
+    final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null, useTcp: _directTcp);
 
     for (final entry in _pendingDelivery.entries) {
       final key = entry.key;
@@ -1023,7 +1035,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _sendAck2(String sid, int tot, String mid) async {
-    final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
+    final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null, useTcp: _directTcp);
     final ackLabel = "ack2-$sid-$tot-$mid";
     final ackNonceA = IdUtils.generateRandomID();
     final ackNonceAAAA = IdUtils.generateRandomID();
@@ -1365,7 +1377,9 @@ class _ChatScreenState extends State<ChatScreen> {
         border: Border.all(color: isRx ? const Color(0xFF1F2C34) : const Color(0xFF004C3F)),
       ),
       child: Column(
-        crossAxisAlignment: isRx ? CrossAxisAlignment.start : CrossAxisAlignment.end,
+        crossAxisAlignment: isRx
+            ? (isRtlMsg ? CrossAxisAlignment.end : CrossAxisAlignment.start)
+            : CrossAxisAlignment.end,
         children: [
           if (isRx)
             Align(
@@ -1374,12 +1388,12 @@ class _ChatScreenState extends State<ChatScreen> {
                 _displayNameForId((msg["from"] ?? "").toString()),
                 textDirection: isRtlMsg ? TextDirection.rtl : TextDirection.ltr,
                 textAlign: isRtlMsg ? TextAlign.right : TextAlign.left,
-                style: const TextStyle(color: Color(0xFF00A884), fontSize: 8, fontWeight: FontWeight.bold, letterSpacing: 1),
+                style: const TextStyle(color: Color(0xFF00A884), fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1),
               ),
             ),
           SelectableText(
             textValue,
-            style: const TextStyle(color: Colors.white, fontSize: 13, height: 1.25),
+            style: const TextStyle(color: Colors.white, fontSize: 15, height: 1.3),
             textDirection: isRtlMsg ? TextDirection.rtl : TextDirection.ltr,
             textAlign: isRtlMsg ? TextAlign.right : TextAlign.left,
           ),
@@ -1388,15 +1402,18 @@ class _ChatScreenState extends State<ChatScreen> {
             mainAxisSize: MainAxisSize.min,
             textDirection: isRtlMsg ? TextDirection.rtl : TextDirection.ltr,
             children: [
-              Text(msg["time"], style: const TextStyle(color: _textDim, fontSize: 8)),
+              Text(msg["time"], style: const TextStyle(color: _textDim, fontSize: 9)),
               const SizedBox(width: 4),
               if (msg["status"] == "error")
-                IconButton(
-                  icon: const Icon(Icons.refresh, size: 14, color: Color(0xFF8696A0)),
-                  tooltip: "Retry",
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
-                  onPressed: () => _retryFailedMessageById(msgMid, msgTs),
+                GestureDetector(
+                  onTap: () => _retryFailedMessageById(msgMid, msgTs),
+                  child: SizedBox(
+                    width: 24,
+                    height: 24,
+                    child: const Center(
+                      child: Icon(Icons.refresh, size: 14, color: Color(0xFF8696A0)),
+                    ),
+                  ),
                 )
               else if (msg["status"] != "received")
                 _buildStatusIcon(msg["status"]),
@@ -1461,7 +1478,7 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       await _saveHistory();
       _setDebugInfo("TX: retrying...");
-      final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
+      final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null, useTcp: _directTcp);
       final text = (msg["text"] ?? "").toString();
       var mid = (msg["mid"] ?? "").toString();
       List<dynamic>? chunks = msg["chunks"] is List ? (msg["chunks"] as List) : null;
@@ -1573,7 +1590,7 @@ class _ChatScreenState extends State<ChatScreen> {
                         maxLengthEnforcement: MaxLengthEnforcement.enforced,
                         textDirection: inputRtl ? TextDirection.rtl : TextDirection.ltr,
                         textAlign: inputRtl ? TextAlign.right : TextAlign.left,
-                        style: const TextStyle(fontSize: 14, color: Colors.white),
+                        style: const TextStyle(fontSize: 15, color: Colors.white),
                         decoration: InputDecoration(
                           hintText: "Message...",
                           hintStyle: const TextStyle(color: _textDim),

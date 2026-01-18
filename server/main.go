@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -31,11 +32,13 @@ const (
 	MESSAGE_TTL          = 24 * time.Hour
 	PAYLOAD_PREVIEW      = 24 // chars
 	ENABLE_STATS_LOG     = false
+	ENABLE_STATS_BAR     = true
+	STATS_BAR_EVERY      = 2 * time.Second
 	ENABLE_VERBOSE_LOG   = false
-	ENABLE_POLL_LOG      = true
+	ENABLE_POLL_LOG      = false
 	ENABLE_RX_CHUNK_LOG  = false
 	ENABLE_ACK2_LOG      = false
-	ENABLE_GC_LOG        = true
+	ENABLE_GC_LOG        = false
 	ENABLE_CLEANUP_LOG   = false
 	ACK2_TTL             = 24 * time.Hour
 	ENABLE_EVENT_LOG     = true
@@ -180,6 +183,10 @@ func purgeMessageByKeyLocked(msgKey string) {
 var (
 	statRxPackets uint64
 	statTxPackets uint64
+	statRxUDP     uint64
+	statRxTCP     uint64
+	statTxUDP     uint64
+	statTxTCP     uint64
 
 	statRxChunks     uint64
 	statRxDupChunks  uint64
@@ -280,6 +287,8 @@ func main() {
 
 	go garbageCollector()
 	go statsLogger()
+	go statsBar()
+	go serveTCP()
 
 	log.Printf("PEYK-D server listening on %s:%d (udp)", LISTEN_IP, LISTEN_PORT)
 
@@ -290,10 +299,87 @@ func main() {
 			continue
 		}
 		atomic.AddUint64(&statRxPackets, 1)
+		atomic.AddUint64(&statRxUDP, 1)
 
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
-		go handlePacket(conn, remoteAddr, pkt)
+		go handlePacket(pkt, udpResponder{conn: conn, addr: remoteAddr}, remoteAddr.String())
+	}
+}
+
+type responseWriter interface {
+	Send(resp []byte) error
+}
+
+type udpResponder struct {
+	conn *net.UDPConn
+	addr *net.UDPAddr
+}
+
+func (u udpResponder) Send(resp []byte) error {
+	_, err := u.conn.WriteToUDP(resp, u.addr)
+	if err == nil {
+		atomic.AddUint64(&statTxUDP, 1)
+	}
+	return err
+}
+
+type tcpResponder struct {
+	conn net.Conn
+}
+
+func (t tcpResponder) Send(resp []byte) error {
+	if len(resp) > 65535 {
+		return fmt.Errorf("dns response too large: %d", len(resp))
+	}
+	lenBuf := make([]byte, 2)
+	binary.BigEndian.PutUint16(lenBuf, uint16(len(resp)))
+	if _, err := t.conn.Write(lenBuf); err != nil {
+		return err
+	}
+	_, err := t.conn.Write(resp)
+	if err == nil {
+		atomic.AddUint64(&statTxTCP, 1)
+	}
+	return err
+}
+
+func serveTCP() {
+	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", LISTEN_IP, LISTEN_PORT))
+	if err != nil {
+		log.Printf("tcp listen failed: %v", err)
+		return
+	}
+	log.Printf("PEYK-D server listening on %s:%d (tcp)", LISTEN_IP, LISTEN_PORT)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+		go handleTCPConn(conn)
+	}
+}
+
+func handleTCPConn(conn net.Conn) {
+	defer conn.Close()
+	remote := conn.RemoteAddr().String()
+	resp := tcpResponder{conn: conn}
+	lenBuf := make([]byte, 2)
+	for {
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			return
+		}
+		msgLen := int(binary.BigEndian.Uint16(lenBuf))
+		if msgLen <= 0 || msgLen > 4096 {
+			return
+		}
+		msg := make([]byte, msgLen)
+		if _, err := io.ReadFull(conn, msg); err != nil {
+			return
+		}
+		atomic.AddUint64(&statRxPackets, 1)
+		atomic.AddUint64(&statRxTCP, 1)
+		handlePacket(msg, resp, remote)
 	}
 }
 
@@ -341,7 +427,7 @@ func parseQNameNoCompression(msg []byte, start int) (string, int, bool) {
 
 // ───────────────────────── Packet Router ─────────────────────────
 
-func handlePacket(conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
+func handlePacket(data []byte, resp responseWriter, remote string) {
 	start := time.Now()
 
 	q, ok := parseQuestion(data)
@@ -359,7 +445,7 @@ func handlePacket(conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
 	txID := data[:2]
 	txIDHex := fmt.Sprintf("%02x%02x", txID[0], txID[1])
 
-	logIf(ENABLE_VERBOSE_LOG, "RX pkt from=%s txid=%s qtype=%d qname=%s", addr.String(), txIDHex, q.QType, domain)
+	logIf(ENABLE_VERBOSE_LOG, "RX pkt from=%s txid=%s qtype=%d qname=%s", remote, txIDHex, q.QType, domain)
 
 	// Polling (NOW: AAAA preferred, fallback to A)
 	if strings.HasPrefix(domain, "v1.sync.") {
@@ -369,8 +455,8 @@ func handlePacket(conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
 			return
 		}
 		atomic.AddUint64(&statPollRequests, 1)
-		handlePolling(conn, addr, txID, domain, q.QType, q.QClass)
-		logIf(ENABLE_VERBOSE_LOG, "done poll from=%s txid=%s took=%s", addr.String(), txIDHex, time.Since(start))
+		handlePolling(resp, remote, txID, domain, q.QType, q.QClass)
+		logIf(ENABLE_VERBOSE_LOG, "done poll from=%s txid=%s took=%s", remote, txIDHex, time.Since(start))
 		return
 	}
 
@@ -379,13 +465,13 @@ func handlePacket(conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
 		atomic.AddUint64(&statIgnored, 1)
 		return
 	}
-	handleInboundOrAck2(conn, addr, txID, domain, q.QType, q.QClass)
-	logIf(ENABLE_VERBOSE_LOG, "done A from=%s txid=%s took=%s", addr.String(), txIDHex, time.Since(start))
+	handleInboundOrAck2(resp, remote, txID, domain, q.QType, q.QClass)
+	logIf(ENABLE_VERBOSE_LOG, "done A from=%s txid=%s took=%s", remote, txIDHex, time.Since(start))
 }
 
 // ───────────────────────── Inbound + ACK2 ─────────────────────────
 
-func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain string, qtype, qclass uint16) {
+func handleInboundOrAck2(resp responseWriter, remote string, txID []byte, domain string, qtype, qclass uint16) {
 	prefix := strings.TrimSuffix(domain, "."+BASE_DOMAIN)
 	label := prefix
 	if dot := strings.IndexByte(prefix, '.'); dot >= 0 {
@@ -440,11 +526,11 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 		storeMu.Unlock()
 
 		atomic.AddUint64(&statRxAck2, 1)
-		logEvent("[ACK2-RX]", "\x1b[36m", "delivery confirmed sid=%s tot=%d mid=%s from=%s queue=%d", sid, tot, mid, addr.String(), queueLen)
-		logIf(ENABLE_ACK2_LOG, "ACK2 stored sid=%s tot=%d mid=%s (queue=%d) from=%s", sid, tot, mid, queueLen, addr.String())
+		logEvent("[ACK2-RX]", "\x1b[36m", "delivery confirmed sid=%s tot=%d mid=%s from=%s queue=%d", sid, tot, mid, remote, queueLen)
+		logIf(ENABLE_ACK2_LOG, "ACK2 stored sid=%s tot=%d mid=%s (queue=%d) from=%s", sid, tot, mid, queueLen, remote)
 
 		// Keep ACK response as A with fixed ACK_IP (unchanged)
-		sendAResponse(conn, addr, txID, domain, ACK_IP, qtype, qclass)
+		sendAResponse(resp, txID, domain, ACK_IP, qtype, qclass)
 		return
 	}
 	// Chunk: idx-tot-mid-sid-rid-payload (mid required)
@@ -489,8 +575,8 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 	if lastSeen, seen := ack2Seen[ackKey]; seen && time.Since(lastSeen) <= ACK2_TTL {
 		storeMu.Unlock()
 		atomic.AddUint64(&statIgnored, 1)
-		logIf(ENABLE_ACK2_LOG, "drop chunk for acked message sid=%s tot=%d mid=%s from=%s", sid, tot, mid, addr.String())
-		sendAResponse(conn, addr, txID, domain, ACK_IP, qtype, qclass)
+		logIf(ENABLE_ACK2_LOG, "drop chunk for acked message sid=%s tot=%d mid=%s from=%s", sid, tot, mid, remote)
+		sendAResponse(resp, txID, domain, ACK_IP, qtype, qclass)
 		return
 	}
 	if messageStore[rid] == nil {
@@ -522,7 +608,7 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 
 	if dup {
 		atomic.AddUint64(&statRxDupChunks, 1)
-		logIf(ENABLE_RX_CHUNK_LOG, "DUP chunk sid=%s->%s %d/%d from=%s", sid, rid, idx, tot, addr.String())
+		logIf(ENABLE_RX_CHUNK_LOG, "DUP chunk sid=%s->%s %d/%d from=%s", sid, rid, idx, tot, remote)
 	} else {
 		atomic.AddUint64(&statRxChunks, 1)
 		logIf(ENABLE_RX_CHUNK_LOG, "RX chunk sid=%s->%s %d/%d payloadLen=%d key=%s chunksInKey=%d preview=%q",
@@ -537,16 +623,16 @@ func handleInboundOrAck2(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, doma
 	}
 
 	// ACK for inbound chunk remains A
-	sendAResponse(conn, addr, txID, domain, ACK_IP, qtype, qclass)
+	sendAResponse(resp, txID, domain, ACK_IP, qtype, qclass)
 }
 
 // ───────────────────────── Polling ─────────────────────────
 
-func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain string, qtype, qclass uint16) {
+func handlePolling(resp responseWriter, remote string, txID []byte, domain string, qtype, qclass uint16) {
 	parts := strings.Split(domain, ".")
 	if len(parts) < 3 {
-		logIf(ENABLE_VERBOSE_LOG, "poll malformed qname=%s from=%s -> NOP", domain, addr.String())
-		sendPollingPayload(conn, addr, txID, domain, "NOP", qtype, qclass)
+		logIf(ENABLE_VERBOSE_LOG, "poll malformed qname=%s from=%s -> NOP", domain, remote)
+		sendPollingPayload(resp, txID, domain, "NOP", qtype, qclass)
 		return
 	}
 	rid := strings.ToLower(parts[2])
@@ -563,9 +649,9 @@ func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain str
 		}
 		storeMu.Unlock()
 
-		logIf(ENABLE_POLL_LOG, "poll rid=%s from=%s -> ACK2 (%s) remaining=%d viaQ=%d", rid, addr.String(), ack, remaining, qtype)
+		logIf(ENABLE_POLL_LOG, "poll rid=%s from=%s -> ACK2 (%s) remaining=%d viaQ=%d", rid, remote, ack, remaining, qtype)
 		logEvent("[ACK2-TX]", "\x1b[35m", "sent to rid=%s ack=%s remaining=%d viaQ=%d", rid, ack, remaining, qtype)
-		sendPollingPayload(conn, addr, txID, domain, ack, qtype, qclass)
+		sendPollingPayload(resp, txID, domain, ack, qtype, qclass)
 		return
 	}
 
@@ -574,7 +660,7 @@ func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain str
 	if !ok || len(msgs) == 0 {
 		storeMu.Unlock()
 
-		sendPollingPayload(conn, addr, txID, domain, "NOP", qtype, qclass)
+		sendPollingPayload(resp, txID, domain, "NOP", qtype, qclass)
 		return
 	}
 
@@ -653,10 +739,10 @@ func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain str
 		storeMu.Unlock()
 
 		logIf(ENABLE_POLL_LOG, "poll rid=%s from=%s -> CHUNK key=%s sent=%d/%d sid=%s payloadLen=%d leftInKey=%d viaQ=%d preview=%q",
-			rid, addr.String(), key, c.Idx, c.Tot, c.SID, len(c.Payload), leftInKey, qtype, preview(full))
+			rid, remote, key, c.Idx, c.Tot, c.SID, len(c.Payload), leftInKey, qtype, preview(full))
 
 		log.Printf("DEBUG-POLL-SEND: rid=%s, msgKey=%s, keyFull=%s", rid, key, keyFull)
-		sendPollingPayload(conn, addr, txID, domain, full, qtype, qclass)
+		sendPollingPayload(resp, txID, domain, full, qtype, qclass)
 		return
 	}
 
@@ -665,18 +751,18 @@ func handlePolling(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain str
 		delete(messageStore, rid)
 	}
 	storeMu.Unlock()
-	sendPollingPayload(conn, addr, txID, domain, "NOP", qtype, qclass)
+	sendPollingPayload(resp, txID, domain, "NOP", qtype, qclass)
 }
 
 // sendPollingPayload sends payload using AAAA if requested; otherwise A fallback.
 // Payload is encoded into multiple AAAA or A RRs (raw bytes packed into IPs).
-func sendPollingPayload(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain, payload string, qtype, qclass uint16) {
+func sendPollingPayload(resp responseWriter, txID []byte, domain, payload string, qtype, qclass uint16) {
 	if qtype == QTYPE_AAAA {
-		sendAAAABytesResponse(conn, addr, txID, domain, []byte(payload), qclass)
+		sendAAAABytesResponse(resp, txID, domain, []byte(payload), qclass)
 		return
 	}
 	// fallback: A
-	sendABytesResponse(conn, addr, txID, domain, []byte(payload), qclass)
+	sendABytesResponse(resp, txID, domain, []byte(payload), qclass)
 }
 
 func resendBackoff(count int) time.Duration {
@@ -794,8 +880,12 @@ func statsLogger() {
 
 	for range ticker.C {
 		var (
-			rx = atomic.LoadUint64(&statRxPackets)
-			tx = atomic.LoadUint64(&statTxPackets)
+			rx    = atomic.LoadUint64(&statRxPackets)
+			tx    = atomic.LoadUint64(&statTxPackets)
+			rxUDP = atomic.LoadUint64(&statRxUDP)
+			rxTCP = atomic.LoadUint64(&statRxTCP)
+			txUDP = atomic.LoadUint64(&statTxUDP)
+			txTCP = atomic.LoadUint64(&statTxTCP)
 
 			rxChunks    = atomic.LoadUint64(&statRxChunks)
 			rxDupChunks = atomic.LoadUint64(&statRxDupChunks)
@@ -830,9 +920,75 @@ func statsLogger() {
 		}
 		storeMu.Unlock()
 
-		log.Printf("📊 STATS rx=%d tx=%d polls=%d rxChunks=%d dupChunks=%d rxAck2=%d txA=%d txAAAA=%d txAPay=%d txTXT=%d parseFail=%d ignored=%d store[rids=%d keys=%d chunks=%d] acks[users=%d total=%d]",
-			rx, tx, polls, rxChunks, rxDupChunks, rxAck2, txA, txAAAA, txAPay, txTXT, parseFail, ignored,
+		log.Printf("📊 STATS udp rx=%d tx=%d | tcp rx=%d tx=%d | rx=%d tx=%d polls=%d rxChunks=%d dupChunks=%d rxAck2=%d txA=%d txAAAA=%d txAPay=%d txTXT=%d parseFail=%d ignored=%d store[rids=%d keys=%d chunks=%d] acks[users=%d total=%d]",
+			rxUDP, txUDP, rxTCP, txTCP, rx, tx, polls, rxChunks, rxDupChunks, rxAck2, txA, txAAAA, txAPay, txTXT, parseFail, ignored,
 			ridCount, keyCount, chunkCount, ackUsers, ackCount)
+	}
+}
+
+func statsBar() {
+	if !ENABLE_STATS_BAR {
+		return
+	}
+	if os.Getenv("TERM") == "" {
+		return
+	}
+	ticker := time.NewTicker(STATS_BAR_EVERY)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		var (
+			rx    = atomic.LoadUint64(&statRxPackets)
+			tx    = atomic.LoadUint64(&statTxPackets)
+			rxUDP = atomic.LoadUint64(&statRxUDP)
+			rxTCP = atomic.LoadUint64(&statRxTCP)
+			txUDP = atomic.LoadUint64(&statTxUDP)
+			txTCP = atomic.LoadUint64(&statTxTCP)
+
+			rxChunks    = atomic.LoadUint64(&statRxChunks)
+			rxDupChunks = atomic.LoadUint64(&statRxDupChunks)
+			rxAck2      = atomic.LoadUint64(&statRxAck2)
+			polls       = atomic.LoadUint64(&statPollRequests)
+
+			txA    = atomic.LoadUint64(&statTxA)
+			txAAAA = atomic.LoadUint64(&statTxAAAA)
+			txAPay = atomic.LoadUint64(&statTxAPay)
+			txTXT  = atomic.LoadUint64(&statTxTXT)
+
+			parseFail = atomic.LoadUint64(&statParseFail)
+			ignored   = atomic.LoadUint64(&statIgnored)
+		)
+
+		storeMu.Lock()
+		var (
+			ridCount   = len(messageStore)
+			keyCount   = 0
+			chunkCount = 0
+			ackUsers   = len(deliveryAcks)
+			ackCount   = 0
+		)
+		for _, msgs := range messageStore {
+			keyCount += len(msgs)
+			for _, chunks := range msgs {
+				chunkCount += len(chunks)
+			}
+		}
+		for _, acks := range deliveryAcks {
+			ackCount += len(acks)
+		}
+		storeMu.Unlock()
+
+		line := fmt.Sprintf(
+			"STATS udp rx=%d tx=%d | tcp rx=%d tx=%d | rx=%d tx=%d polls=%d rxChunks=%d dup=%d ack2=%d txA=%d txAAAA=%d txAPay=%d txTXT=%d parseFail=%d ignored=%d store[rids=%d keys=%d chunks=%d] acks[users=%d total=%d]",
+			rxUDP, txUDP, rxTCP, txTCP, rx, tx, polls, rxChunks, rxDupChunks, rxAck2, txA, txAAAA, txAPay, txTXT, parseFail, ignored,
+			ridCount, keyCount, chunkCount, ackUsers, ackCount,
+		)
+		if len(line) > 240 {
+			line = line[:240]
+		}
+
+		// Save cursor, move home, clear line, print stats, keep a blank line, restore cursor.
+		fmt.Fprintf(os.Stderr, "\x1b7\x1b[H\x1b[2K %s \n\x1b[2K\x1b8", line)
 	}
 }
 
@@ -867,9 +1023,9 @@ func buildBaseResponse(txID []byte, domain string, qtype, qclass uint16, ancount
 }
 
 // Original ACK response (single A RR)
-func sendAResponse(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain, ipStr string, qtype, qclass uint16) {
-	resp := buildBaseResponse(txID, domain, qtype, qclass, 1)
-	resp = append(resp,
+func sendAResponse(resp responseWriter, txID []byte, domain, ipStr string, qtype, qclass uint16) {
+	respMsg := buildBaseResponse(txID, domain, qtype, qclass, 1)
+	respMsg = append(respMsg,
 		0xc0, 0x0c, // NAME ptr
 		0x00, 0x01, // TYPE A
 		0x00, 0x01, // CLASS IN
@@ -877,9 +1033,9 @@ func sendAResponse(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain, ip
 		0x00, 0x04, // RDLEN 4
 	)
 	ip := net.ParseIP(ipStr).To4()
-	resp = append(resp, ip...)
+	respMsg = append(respMsg, ip...)
 
-	_, _ = conn.WriteToUDP(resp, addr)
+	_ = resp.Send(respMsg)
 
 	atomic.AddUint64(&statTxPackets, 1)
 	atomic.AddUint64(&statTxA, 1)
@@ -887,22 +1043,22 @@ func sendAResponse(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain, ip
 
 // sendAAAABytesResponse packs payload bytes into multiple AAAA answers.
 // Each AAAA carries 1-byte index + 15 bytes payload. Last chunk is zero-padded.
-func sendAAAABytesResponse(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain string, payload []byte, qclass uint16) {
+func sendAAAABytesResponse(resp responseWriter, txID []byte, domain string, payload []byte, qclass uint16) {
 	ips := packBytesToIPv6(payload)
-	resp := buildBaseResponse(txID, domain, QTYPE_AAAA, qclass, uint16(len(ips)))
+	respMsg := buildBaseResponse(txID, domain, QTYPE_AAAA, qclass, uint16(len(ips)))
 
 	for _, ip16 := range ips {
-		resp = append(resp,
+		respMsg = append(respMsg,
 			0xc0, 0x0c, // NAME ptr
 			0x00, 0x1c, // TYPE AAAA
 			0x00, 0x01, // CLASS IN
 			0x00, 0x00, 0x00, 0x00, // TTL 0
 			0x00, 0x10, // RDLEN 16
 		)
-		resp = append(resp, ip16[:]...)
+		respMsg = append(respMsg, ip16[:]...)
 	}
 
-	_, _ = conn.WriteToUDP(resp, addr)
+	_ = resp.Send(respMsg)
 
 	atomic.AddUint64(&statTxPackets, 1)
 	atomic.AddUint64(&statTxAAAA, 1)
@@ -910,22 +1066,22 @@ func sendAAAABytesResponse(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, do
 
 // sendABytesResponse packs payload bytes into multiple A answers (fallback).
 // Each A carries 1-byte index + 3 bytes payload. Last chunk is zero-padded.
-func sendABytesResponse(conn *net.UDPConn, addr *net.UDPAddr, txID []byte, domain string, payload []byte, qclass uint16) {
+func sendABytesResponse(resp responseWriter, txID []byte, domain string, payload []byte, qclass uint16) {
 	ips := packBytesToIPv4(payload)
-	resp := buildBaseResponse(txID, domain, QTYPE_A, qclass, uint16(len(ips)))
+	respMsg := buildBaseResponse(txID, domain, QTYPE_A, qclass, uint16(len(ips)))
 
 	for _, ip4 := range ips {
-		resp = append(resp,
+		respMsg = append(respMsg,
 			0xc0, 0x0c, // NAME ptr
 			0x00, 0x01, // TYPE A
 			0x00, 0x01, // CLASS IN
 			0x00, 0x00, 0x00, 0x00, // TTL 0
 			0x00, 0x04, // RDLEN 4
 		)
-		resp = append(resp, ip4[:]...)
+		respMsg = append(respMsg, ip4[:]...)
 	}
 
-	_, _ = conn.WriteToUDP(resp, addr)
+	_ = resp.Send(respMsg)
 
 	atomic.AddUint64(&statTxPackets, 1)
 	atomic.AddUint64(&statTxAPay, 1)

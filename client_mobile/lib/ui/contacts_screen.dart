@@ -31,19 +31,26 @@ class _ContactsScreenState extends State<ContactsScreen> {
   static const String _contactsKey = 'contacts_list';
   static const String _contactNamesKey = 'contacts_names';
   static const String _unreadKey = 'contacts_unread';
-  static const String _changelogV1 = "تاریخچه تغییرات\n"
-      "2026-01-17 02:08 - بهینه سازی نمایش وضعیت Polling\n"
-      "2026-01-17 02:01 - اصلاح محاسبه درصد دریافت\n"
-      "2026-01-17 01:16 - انتقال Decode/Decrypt به Isolate و رفع قاطی شدن ارسال/دریافت\n"
-      "2026-01-16 22:54 - پاکسازی ACK2 و بهبود Polling\n"
-      "2026-01-16 14:06 - اصلاح نمایش تیک دوم پس از ریست\n"
-      "2026-01-16 13:21 - بهبود پشتیبانی RTL در ورودی و حباب پیام\n"
-      "2026-01-16 13:16 - نوتیفیکیشن محلی + بهبود فوکوس ورودی\n"
-      "2026-01-16 11:58 - Backoff ارسال مجدد و حذف تکراری های دریافت\n"
-      "2026-01-15 17:02 - افزودن لیست مخاطبین و تاریخچه پیام هر چت\n"
-      "2026-01-15 02:16 - جایگزینی تونل TXT با AAAA/A\n"
-      "2026-01-14 18:51 - بهبود ارسال پیام های طولانی\n"
-      "2026-01-13 16:52 - تنظیم دامنه پایه و ذخیره تنظیمات";
+  static const String _changelogV1 = """
+CHANGELOG - Version 1.1
+2026-01-17 12:00 - v1.1 - TX retry button + safe retry by mid/ts
+2026-01-17 12:00 - v1.1 - ACK2 resend for late chunks
+2026-01-17 12:00 - v1.1 - DNS timeout tuned for 350-400ms RTT
+2026-01-17 12:00 - v1.1 - Polling burst tuning and RX guardrails
+2026-01-17 12:00 - v1.1 - Font sizes improved in chat/contacts
+2026-01-17 02:08 - Polling improvements
+2026-01-17 02:01 - RX buffer fixes
+2026-01-17 01:16 - Decode/Decrypt moved to isolate
+2026-01-16 22:54 - ACK2 in polling
+2026-01-16 14:06 - Contact name support
+2026-01-16 13:21 - RTL rendering fixes
+2026-01-16 13:16 - Advanced settings + location modes
+2026-01-16 11:58 - Backoff handling
+2026-01-15 17:02 - Base protocol cleanup
+2026-01-15 02:16 - TXT -> AAAA/A migration
+2026-01-14 18:51 - RX error handling
+2026-01-13 16:52 - DNS transport refactor
+""";
 
   String _myId = '';
   List<String> _contacts = [];
@@ -55,6 +62,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
   bool _pollingEnabled = true;
   bool _fallbackEnabled = false;
   bool _useDirectServer = false;
+  bool _directTcp = false;
   bool _sendViaAAAA = false;
   bool _debugMode = false;
   int _pollMin = 20;
@@ -118,9 +126,10 @@ class _ContactsScreenState extends State<ContactsScreen> {
     final defaultServerIP = PeykProtocol.defaultServerIP;
     if (nextLocation.isEmpty) {
       final savedDirect = prefs.getBool('use_direct_server') ?? false;
+      final savedDirectTcp = prefs.getBool('direct_tcp') ?? false;
       final savedIP = prefs.getString('server_ip') ?? "";
       if (savedDirect && defaultServerIP.isNotEmpty && savedIP == defaultServerIP) {
-        nextLocation = "other";
+        nextLocation = savedDirectTcp ? "other_direct" : "other";
       } else {
         nextLocation = "iran";
       }
@@ -138,6 +147,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
       _debugMode = prefs.getBool('debug_mode') ?? false;
       _fallbackEnabled = prefs.getBool('fallback_enabled') ?? true;
       _useDirectServer = prefs.getBool('use_direct_server') ?? false;
+      _directTcp = prefs.getBool('direct_tcp') ?? false;
       _sendViaAAAA = prefs.getBool('send_via_aaaa') ?? false;
       _baseDomain = prefs.getString('base_domain') ?? PeykProtocol.baseDomain;
       _serverIP = prefs.getString('server_ip') ?? PeykProtocol.defaultServerIP;
@@ -145,11 +155,20 @@ class _ContactsScreenState extends State<ContactsScreen> {
 
       if (_locationMode == "iran") {
         _useDirectServer = false;
+        _directTcp = false;
         _sendViaAAAA = true;
         _fallbackEnabled = true;
         _retryCount = 3;
       } else if (_locationMode == "other") {
         _useDirectServer = true;
+        _directTcp = false;
+        _serverIP = defaultServerIP;
+        _sendViaAAAA = true;
+        _fallbackEnabled = true;
+        _retryCount = 3;
+      } else if (_locationMode == "other_direct") {
+        _useDirectServer = true;
+        _directTcp = true;
         _serverIP = defaultServerIP;
         _sendViaAAAA = true;
         _fallbackEnabled = true;
@@ -201,13 +220,13 @@ class _ContactsScreenState extends State<ContactsScreen> {
             children: [
               TextField(
                 controller: ctrl,
-                style: const TextStyle(fontSize: 13),
+                style: const TextStyle(fontSize: 14),
                 decoration: InputDecoration(
                   labelText: "Node ID",
                   hintText: "abcde",
                   errorText: error,
                   prefixIcon: const Icon(Icons.person_add, size: 18, color: Color(0xFF00A884)),
-                  labelStyle: const TextStyle(color: Colors.white54, fontSize: 12),
+                  labelStyle: const TextStyle(color: Colors.white54, fontSize: 13),
                   filled: true,
                   fillColor: const Color(0xFF202C33),
                   border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
@@ -216,12 +235,12 @@ class _ContactsScreenState extends State<ContactsScreen> {
               const SizedBox(height: 10),
               TextField(
                 controller: nameCtrl,
-                style: const TextStyle(fontSize: 13),
+                style: const TextStyle(fontSize: 14),
                 decoration: InputDecoration(
                   labelText: "Display Name (optional)",
                   hintText: "Nickname",
                   prefixIcon: const Icon(Icons.badge, size: 18, color: Color(0xFF00A884)),
-                  labelStyle: const TextStyle(color: Colors.white54, fontSize: 12),
+                  labelStyle: const TextStyle(color: Colors.white54, fontSize: 13),
                   filled: true,
                   fillColor: const Color(0xFF202C33),
                   border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
@@ -274,22 +293,22 @@ class _ContactsScreenState extends State<ContactsScreen> {
           borderRadius: BorderRadius.circular(16),
           side: BorderSide(color: const Color(0xFF00A884).withOpacity(0.3)),
         ),
-        title: const Text("EDIT NAME", style: TextStyle(fontSize: 12, letterSpacing: 2, fontWeight: FontWeight.bold, color: Color(0xFF00A884))),
+          title: const Text("EDIT NAME", style: TextStyle(fontSize: 12, letterSpacing: 2, fontWeight: FontWeight.bold, color: Color(0xFF00A884))),
         content: TextField(
           controller: ctrl,
-          style: const TextStyle(fontSize: 13),
+          style: const TextStyle(fontSize: 14),
           decoration: InputDecoration(
             labelText: "Display Name",
             hintText: "Nickname",
             prefixIcon: const Icon(Icons.badge, size: 18, color: Color(0xFF00A884)),
-            labelStyle: const TextStyle(color: Colors.white54, fontSize: 12),
+            labelStyle: const TextStyle(color: Colors.white54, fontSize: 13),
             filled: true,
             fillColor: const Color(0xFF202C33),
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
           ),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("CANCEL", style: TextStyle(color: Colors.white30))),
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text("CANCEL", style: TextStyle(color: Colors.white30))),
           ElevatedButton(
             style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00A884), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
             onPressed: () async {
@@ -345,41 +364,65 @@ class _ContactsScreenState extends State<ContactsScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text("LOCATION", style: TextStyle(fontSize: 10, letterSpacing: 2, color: Color(0xFF8696A0))),
+                      const Text("LOCATION", style: TextStyle(fontSize: 11, letterSpacing: 2, color: Color(0xFF8696A0))),
                       const SizedBox(height: 6),
                       DropdownButtonFormField<String>(
+                        isExpanded: true,
                         value: locationMode,
                         dropdownColor: const Color(0xFF202C33),
                         decoration: InputDecoration(
-                          labelText: "Location",
-                          labelStyle: const TextStyle(color: Color(0xFF8696A0), fontSize: 12),
+                          floatingLabelBehavior: FloatingLabelBehavior.never,
+                          hintText: "",
+                          labelStyle: const TextStyle(color: Color(0xFF8696A0), fontSize: 13),
                           filled: true,
                           fillColor: const Color(0xFF202C33),
                           border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
                         ),
-                        items: const [
-                          DropdownMenuItem(value: "iran", child: Text("Iran", style: TextStyle(color: Colors.white))),
-                          DropdownMenuItem(value: "other", child: Text("Other Countries", style: TextStyle(color: Colors.white))),
-                          DropdownMenuItem(value: "advanced", child: Text("Advanced", style: TextStyle(color: Colors.white))),
-                        ],
+                          items: const [
+                            DropdownMenuItem(
+                              value: "iran",
+                              child: Text("Iran", style: TextStyle(color: Colors.white, fontSize: 12), overflow: TextOverflow.ellipsis),
+                            ),
+                            DropdownMenuItem(
+                              value: "other",
+                              child: Text("Other Countries (Slow)", style: TextStyle(color: Colors.white, fontSize: 12), overflow: TextOverflow.ellipsis),
+                            ),
+                            DropdownMenuItem(
+                              value: "other_direct",
+                              child: Text("Other Countries (Fast)", style: TextStyle(color: Colors.white, fontSize: 12), overflow: TextOverflow.ellipsis),
+                            ),
+                            DropdownMenuItem(
+                              value: "advanced",
+                              child: Text("Advanced", style: TextStyle(color: Colors.white, fontSize: 12), overflow: TextOverflow.ellipsis),
+                            ),
+                          ],
                         onChanged: (value) {
                           if (value == null) return;
-                          setL(() {
-                            locationMode = value;
-                            if (locationMode == "iran") {
-                              _useDirectServer = false;
-                              _sendViaAAAA = true;
-                              _fallbackEnabled = true;
-                            } else if (locationMode == "other") {
-                              _useDirectServer = true;
-                              _sendViaAAAA = true;
-                              _fallbackEnabled = true;
-                              ipCtrl.text = PeykProtocol.defaultServerIP;
-                            } else if (locationMode == "advanced") {
-                              ipCtrl.text = "";
-                              domainCtrl.text = "";
-                              pollMinCtrl.text = "";
-                              pollMaxCtrl.text = "";
+                            setL(() {
+                              locationMode = value;
+                              if (locationMode == "iran") {
+                                _useDirectServer = false;
+                                _directTcp = false;
+                                _sendViaAAAA = true;
+                                _fallbackEnabled = true;
+                              } else if (locationMode == "other") {
+                                _useDirectServer = true;
+                                _directTcp = false;
+                                _sendViaAAAA = true;
+                                _fallbackEnabled = true;
+                                ipCtrl.text = PeykProtocol.defaultServerIP;
+                              } else if (locationMode == "other_direct") {
+                                _useDirectServer = true;
+                                _directTcp = true;
+                                _sendViaAAAA = true;
+                                _fallbackEnabled = true;
+                                ipCtrl.text = PeykProtocol.defaultServerIP;
+                              } else if (locationMode == "advanced") {
+                                _directTcp = false;
+                                ipCtrl.text = "";
+                                domainCtrl.text = "";
+                                pollMinCtrl.text = "";
+                                pollMaxCtrl.text = "";
                             }
                           });
                         },
@@ -401,12 +444,12 @@ class _ContactsScreenState extends State<ContactsScreen> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          const Text("ADVANCED", style: TextStyle(fontSize: 10, letterSpacing: 2, color: Color(0xFF8696A0))),
+                          const Text("ADVANCED", style: TextStyle(fontSize: 11, letterSpacing: 2, color: Color(0xFF8696A0))),
                           _buildSettingField(ipCtrl, "Relay Server IP", Icons.lan, "Custom IP"),
                           _buildSettingField(domainCtrl, "Base Domain", Icons.dns, "Custom Domain"),
                           SwitchListTile(
                             contentPadding: EdgeInsets.zero,
-                            title: const Text("Use Direct Server IP", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                            title: const Text("Direct Server", style: TextStyle(fontSize: 12, color: Colors.white70)),
                             value: _useDirectServer,
                             activeColor: const Color(0xFF00A884),
                             onChanged: (v) => setL(() => _useDirectServer = v),
@@ -426,14 +469,14 @@ class _ContactsScreenState extends State<ContactsScreen> {
                           _buildSettingField(retryCtrl, "Retries", Icons.repeat, ">= 1", isNum: true),
                           SwitchListTile(
                             contentPadding: EdgeInsets.zero,
-                            title: const Text("Active Polling", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                            title: const Text("Polling Enabled", style: TextStyle(fontSize: 12, color: Colors.white70)),
                             value: _pollingEnabled,
                             activeColor: const Color(0xFF00A884),
                             onChanged: (v) => setL(() => _pollingEnabled = v),
                           ),
                           SwitchListTile(
                             contentPadding: EdgeInsets.zero,
-                            title: const Text("A Fallback on No Response", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                            title: const Text("Fallback Enabled", style: TextStyle(fontSize: 12, color: Colors.white70)),
                             value: _fallbackEnabled,
                             activeColor: const Color(0xFF00A884),
                             onChanged: (v) => setL(() => _fallbackEnabled = v),
@@ -453,7 +496,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
             ),
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text("DISCARD", style: TextStyle(color: Colors.white30))),
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text("CANCEL", style: TextStyle(color: Colors.white30))),
             ElevatedButton(
               style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00A884), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
               onPressed: () async {
@@ -461,6 +504,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
                 String nextServerIP = _serverIP;
                 String nextDomain = _baseDomain;
                 bool nextUseDirect = _useDirectServer;
+                bool nextDirectTcp = _directTcp;
                 bool nextSendViaAAAA = _sendViaAAAA;
                 bool nextFallback = _fallbackEnabled;
                 int nextPollMin = _pollMin;
@@ -469,16 +513,26 @@ class _ContactsScreenState extends State<ContactsScreen> {
 
                 if (selectedLocation == "iran") {
                   nextUseDirect = false;
+                  nextDirectTcp = false;
                   nextSendViaAAAA = true;
                   nextFallback = true;
                   nextRetryCount = 3;
                 } else if (selectedLocation == "other") {
                   nextUseDirect = true;
+                  nextDirectTcp = false;
+                  nextServerIP = PeykProtocol.defaultServerIP;
+                  nextSendViaAAAA = true;
+                  nextFallback = true;
+                  nextRetryCount = 3;
+                } else if (selectedLocation == "other_direct") {
+                  nextUseDirect = true;
+                  nextDirectTcp = true;
                   nextServerIP = PeykProtocol.defaultServerIP;
                   nextSendViaAAAA = true;
                   nextFallback = true;
                   nextRetryCount = 3;
                 } else {
+                  nextDirectTcp = _directTcp;
                   final nextIP = ipCtrl.text.trim();
                   final nextBase = domainCtrl.text.trim();
                   if (nextIP.isNotEmpty) {
@@ -511,6 +565,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
                 await prefs.setBool('debug_mode', _debugMode);
                 await prefs.setBool('fallback_enabled', nextFallback);
                 await prefs.setBool('use_direct_server', nextUseDirect);
+                await prefs.setBool('direct_tcp', nextDirectTcp);
                 await prefs.setBool('send_via_aaaa', nextSendViaAAAA);
                 setState(() {
                   _pollMin = nextPollMin;
@@ -519,6 +574,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
                   _serverIP = nextServerIP;
                   _baseDomain = nextDomain;
                   _useDirectServer = nextUseDirect;
+                  _directTcp = nextDirectTcp;
                   _sendViaAAAA = nextSendViaAAAA;
                   _fallbackEnabled = nextFallback;
                   _locationMode = selectedLocation;
@@ -600,15 +656,15 @@ class _ContactsScreenState extends State<ContactsScreen> {
           style: TextStyle(fontSize: 12, letterSpacing: 2, fontWeight: FontWeight.bold, color: Color(0xFF00A884)),
         ),
         content: const Directionality(
-          textDirection: TextDirection.rtl,
+          textDirection: TextDirection.ltr,
           child: Text(
             "این نرم افزار در دوره قطع کامل اینترنت ایران برای ایجاد یک کانال ارتباطی اضطراری ساخته شد. این یک پیامرسان کامل نیست و محدودیت های آن به دلیل تکیه بر حداقل امکانات ارتباطی موجود است.",
             style: TextStyle(fontSize: 12, color: Colors.white70, height: 1.5),
           ),
         ),
         actions: [
-          TextButton(onPressed: _showChangelog, child: const Text("تاریخچه تغییرات", style: TextStyle(color: Color(0xFF00A884)))),
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("بستن", style: TextStyle(color: Colors.white30))),
+          TextButton(onPressed: _showChangelog, child: const Text("CHANGELOG", style: TextStyle(color: Color(0xFF00A884)))),
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("CLOSE", style: TextStyle(color: Colors.white30))),
         ],
       ),
     );
@@ -628,20 +684,21 @@ class _ContactsScreenState extends State<ContactsScreen> {
           style: TextStyle(fontSize: 12, letterSpacing: 2, fontWeight: FontWeight.bold, color: Color(0xFF00A884)),
         ),
         content: Directionality(
-          textDirection: TextDirection.rtl,
+            textDirection: TextDirection.ltr,
           child: SizedBox(
             width: double.maxFinite,
             height: 240,
             child: SingleChildScrollView(
               child: Text(
-                _changelogV1,
-                style: const TextStyle(fontSize: 12, color: Colors.white70, height: 1.5),
+                  _changelogV1,
+                  textAlign: TextAlign.left,
+                  style: const TextStyle(fontSize: 12, color: Colors.white70, height: 1.5),
               ),
             ),
           ),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("بستن", style: TextStyle(color: Colors.white30))),
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("CLOSE", style: TextStyle(color: Colors.white30))),
         ],
       ),
     );
@@ -671,7 +728,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
     if (!_pollingEnabled) return;
     _gcBuffers();
 
-    final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
+    final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null, useTcp: _directTcp);
     bool hasMore = true;
     const int burstAttempts = 3;
     const int burstMinMs = 200;
@@ -880,7 +937,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
         await _incrementUnread(sid);
         await NotificationService.showIncomingMessage(_displayNameForId(sid), decrypted);
 
-        final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null);
+        final transport = DnsTransport(serverIP: _useDirectServer ? _serverIP : null, useTcp: _directTcp);
         final ackLabel = "ack2-$sid-$tot-$mid";
         final ackNonceA = IdUtils.generateRandomID();
         final ackNonceAAAA = IdUtils.generateRandomID();
@@ -912,7 +969,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text("CONTACTS", style: TextStyle(letterSpacing: 3, fontSize: 12, fontWeight: FontWeight.bold)),
+        title: const Text("CONTACTS", style: TextStyle(fontSize: 12, letterSpacing: 2, fontWeight: FontWeight.bold, color: Color(0xFF00A884))),
         actions: [
           IconButton(icon: const Icon(Icons.settings, size: 20), onPressed: _showSettings),
           IconButton(icon: const Icon(Icons.info_outline, size: 20), onPressed: _showAbout),
@@ -960,7 +1017,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
                       Expanded(
                         child: Text(
                           "YOUR NODE: $_myId",
-                          style: const TextStyle(color: Color(0xFF8696A0), fontSize: 10, letterSpacing: 1),
+                          style: const TextStyle(color: Color(0xFF8696A0), fontSize: 12, letterSpacing: 1),
                         ),
                       ),
                     ],
@@ -971,7 +1028,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
                 padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
                 child: TextField(
                   controller: _searchCtrl,
-                  style: const TextStyle(fontSize: 13, color: Colors.white),
+                  style: const TextStyle(fontSize: 14, color: Colors.white),
                   decoration: InputDecoration(
                     hintText: "Search contacts...",
                     prefixIcon: const Icon(Icons.search, size: 18, color: Color(0xFF8696A0)),
@@ -989,10 +1046,10 @@ class _ContactsScreenState extends State<ContactsScreen> {
                           children: const [
                             Icon(Icons.person_search, color: Color(0xFF374248), size: 32),
                             SizedBox(height: 10),
-                            Text("No contacts yet", style: TextStyle(color: Color(0xFF8696A0), fontSize: 12)),
+                            Text("No contacts yet", style: TextStyle(color: Color(0xFF8696A0), fontSize: 13)),
                             SizedBox(height: 4),
                             Text("Add your first contact to start chatting",
-                                style: TextStyle(color: Color(0xFF5C6B75), fontSize: 10)),
+                                style: TextStyle(color: Color(0xFF5C6B75), fontSize: 11)),
                           ],
                         ),
                       )
@@ -1022,7 +1079,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
                                 children: const [
                                   Icon(Icons.delete, color: Colors.white, size: 18),
                                   SizedBox(width: 6),
-                                  Text("Delete", style: TextStyle(color: Colors.white, fontSize: 12)),
+                                  Text("Delete", style: TextStyle(color: Colors.white, fontSize: 13)),
                                 ],
                               ),
                             ),
@@ -1050,7 +1107,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
                                           color: Color(0xFF25D366),
                                         ),
                                         child: Center(
-                                          child: Text(initials, style: const TextStyle(color: Colors.white, fontSize: 14)),
+                                          child: Text(initials, style: const TextStyle(color: Colors.white, fontSize: 15)),
                                         ),
                                       ),
                                       const SizedBox(width: 12),
@@ -1058,9 +1115,9 @@ class _ContactsScreenState extends State<ContactsScreen> {
                                         child: Column(
                                           crossAxisAlignment: CrossAxisAlignment.start,
                                           children: [
-                                            Text(title, style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                            Text(title, style: const TextStyle(color: Colors.white, fontSize: 15)),
                                             if (displayName?.isNotEmpty == true)
-                                              Text(id, style: const TextStyle(color: Color(0xFF8696A0), fontSize: 10)),
+                                              Text(id, style: const TextStyle(color: Color(0xFF8696A0), fontSize: 12)),
                                           ],
                                         ),
                                       ),
@@ -1077,7 +1134,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
                                           ),
                                           child: Text(
                                             unread > 99 ? "99+" : unread.toString(),
-                                            style: const TextStyle(color: Colors.white, fontSize: 10),
+                                            style: const TextStyle(color: Colors.white, fontSize: 11),
                                           ),
                                         ),
                                     ],

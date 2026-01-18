@@ -7,14 +7,22 @@ import './dns_codec.dart';
 class DnsTransport {
   final String? serverIP;
   final int port;
+  final bool useTcp;
 
-  DnsTransport({this.serverIP, this.port = 53});
+  DnsTransport({this.serverIP, this.port = 53, this.useTcp = false});
 
   bool get _useDirect => serverIP != null && serverIP!.isNotEmpty;
+  bool get _useTcp => _useDirect && useTcp;
 
   Future<void> sendOnly(String domain, {int qtype = 1}) async {
     if (!_useDirect) {
       await _lookup(domain, qtype: qtype);
+      return;
+    }
+
+    if (_useTcp) {
+      final query = DnsCodec.buildQuery(domain, qtype: qtype);
+      await _sendAndReceiveRawTcp(query, timeoutMs: 2500);
       return;
     }
 
@@ -39,6 +47,11 @@ class DnsTransport {
     }
 
     final query = DnsCodec.buildQuery(domain, qtype: qtype);
+    if (_useTcp) {
+      final raw = await _sendAndReceiveRawTcp(query, timeoutMs: timeoutMs);
+      if (raw == null) return null;
+      return DnsCodec.extractAllBytes(raw);
+    }
     final raw = await _sendAndReceiveRaw(query, timeoutMs: timeoutMs);
     if (raw == null) return null;
     return DnsCodec.extractAllBytes(raw);
@@ -50,7 +63,9 @@ class DnsTransport {
       0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
       0x00, 0x00, 0x00, 0x00, 0x01, 0x76, 0x00, 0x00, 0x01, 0x00, 0x01
     ]);
-    final res = await _sendAndReceiveRaw(ping, timeoutMs: 1500);
+    final res = _useTcp
+        ? await _sendAndReceiveRawTcp(ping, timeoutMs: 1500)
+        : await _sendAndReceiveRaw(ping, timeoutMs: 1500);
     return res != null;
   }
 
@@ -94,6 +109,59 @@ class DnsTransport {
       socket?.close();
       return null;
     }
+  }
+
+  Future<Uint8List?> _sendAndReceiveRawTcp(Uint8List query, {int timeoutMs = 2500}) async {
+    if (query.length < 2) return null;
+    Socket? socket;
+    StreamSubscription<List<int>>? sub;
+    Timer? timeoutTimer;
+    final completer = Completer<Uint8List?>();
+    final buffer = BytesBuilder();
+    int? expectedLen;
+
+    void finish(Uint8List? data) {
+      if (completer.isCompleted) return;
+      timeoutTimer?.cancel();
+      sub?.cancel();
+      socket?.destroy();
+      completer.complete(data);
+    }
+
+    try {
+      socket = await Socket.connect(
+        serverIP!,
+        port,
+        timeout: Duration(milliseconds: timeoutMs),
+      );
+    } catch (_) {
+      return null;
+    }
+
+    timeoutTimer = Timer(Duration(milliseconds: timeoutMs), () => finish(null));
+    sub = socket.listen(
+      (data) {
+        buffer.add(data);
+        final bytes = buffer.toBytes();
+        if (expectedLen == null && bytes.length >= 2) {
+          expectedLen = (bytes[0] << 8) | bytes[1];
+        }
+        if (expectedLen != null && bytes.length >= expectedLen! + 2) {
+          finish(Uint8List.fromList(bytes.sublist(2, 2 + expectedLen!)));
+        }
+      },
+      onError: (_) => finish(null),
+      onDone: () => finish(null),
+    );
+
+    final lenBuf = Uint8List(2);
+    lenBuf[0] = (query.length >> 8) & 0xff;
+    lenBuf[1] = query.length & 0xff;
+    socket.add(lenBuf);
+    socket.add(query);
+    await socket.flush();
+
+    return completer.future;
   }
 
   void _safeComplete(Completer c, dynamic value) {
